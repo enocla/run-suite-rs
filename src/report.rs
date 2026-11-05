@@ -73,7 +73,7 @@ impl Reporter {
                 "test {} ... {} {}",
                 self.style(&safe_text(&result.name), "1;36"),
                 self.style(word, code),
-                self.style(&format!("({:.3}s)", result.elapsed.as_secs_f64()), "2")
+                self.style(&format!("({})", format_duration(result.elapsed)), "2")
             );
         }
         let _ = io::stdout().flush();
@@ -367,8 +367,16 @@ impl Reporter {
             ),
             self.style(&format!("{filtered} filtered out"), "33"),
             self.style(&format!("{skipped} skipped"), "35"),
-            self.style(&format!("finished in {:.3}s", elapsed.as_secs_f64()), "2")
+            self.style(&format!("finished in {}", format_duration(elapsed)), "2")
         );
+    }
+}
+
+pub(crate) fn format_duration(duration: Duration) -> String {
+    if duration < Duration::from_secs(1) {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{:.3}s", duration.as_secs_f64())
     }
 }
 

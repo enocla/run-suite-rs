@@ -306,8 +306,8 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
     result.stderr = required(&stderr_path)?;
     if timed_out {
         result.problems.push(Problem::Message(format!(
-            "timed out after {:.3}s",
-            cli.timeout.unwrap().as_secs_f64()
+            "timed out after {}",
+            crate::report::format_duration(cli.timeout.unwrap())
         )));
     } else {
         compare(

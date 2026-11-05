@@ -37,9 +37,9 @@ commands, and summary counts are colored on a terminal):
 
 ```text
 running 3 tests
-test test1 ... ok (0.002s)
-test test2 ... FAILED (0.003s)
-test test3 ... ok (0.002s)
+test test1 ... ok (2ms)
+test test2 ... FAILED (3ms)
+test test3 ... ok (2ms)
 
 failures:
 
@@ -53,7 +53,7 @@ stdout differs at byte 0 (expected 4 bytes, actual 4 bytes)
 failures:
     test2
 
-test result: FAILED. 2 passed; 1 failed; 0 filtered out; 0 skipped; finished in 0.007s
+test result: FAILED. 2 passed; 1 failed; 0 filtered out; 0 skipped; finished in 7ms
 ```
 
 ## Suite format

@@ -754,7 +754,7 @@ fn timeout_kills_the_process_group_and_preserves_partial_output() {
     let output = suite.run(&["--timeout", "0.25"]);
     status(&output, 1);
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(stdout(&output).contains("timed out after 0.250s"));
+    assert!(stdout(&output).contains("timed out after 250ms"));
     assert!(stdout(&output).contains("partial"));
     std::thread::sleep(Duration::from_millis(900));
     assert!(!suite.dir.path().join("survived").exists());
