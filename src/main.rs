@@ -51,16 +51,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let reporter = Reporter::new(cli.color, cli.quiet, cli.nocapture, cli.diff_tool.clone());
     reporter.start(selected.len());
     let start = Instant::now();
-    let mut results = Vec::new();
-    for stem in &selected {
-        let result = runner::run_test(stem, &program, cli);
-        let failed = !result.passed();
-        reporter.result(&result);
-        results.push(result);
-        if failed && cli.fail_fast {
-            break;
-        }
-    }
+    let results = runner::run_tests(&selected, &program, cli, |result| reporter.result(result));
     reporter.failures(&results, &program, cli);
     reporter.summary(
         &results,

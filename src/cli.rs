@@ -1,6 +1,6 @@
 use crate::diff::DiffTool;
 use clap::{Parser, ValueEnum};
-use std::{path::PathBuf, time::Duration};
+use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -10,7 +10,7 @@ use std::{path::PathBuf, time::Duration};
     about = "Run CS246 suites with cargo-test-style results"
 )]
 pub struct Cli {
-    /// Whitespace-separated test stems, resolved from the working directory
+    /// Whitespace-separated test stems, resolved relative to the suite file
     #[arg(value_name = "SUITE", required_unless_present = "tests")]
     pub suite: Option<PathBuf>,
 
@@ -47,7 +47,11 @@ pub struct Cli {
     #[arg(long)]
     pub list: bool,
 
-    /// Stop after the first failed test
+    /// Maximum number of tests to run in parallel; use 1 for sequential execution
+    #[arg(short = 'j', long, value_name = "N", default_value = "50")]
+    pub jobs: NonZeroUsize,
+
+    /// Stop reporting at the first failed test in suite order
     #[arg(long)]
     #[arg(short = 'f')]
     pub fail_fast: bool,
@@ -71,6 +75,18 @@ pub struct Cli {
     /// Failure diff: auto tries delta, git, diff; builtin or a quoted command overrides it
     #[arg(long, value_name = "COMMAND", default_value = "auto")]
     pub diff_tool: DiffTool,
+}
+
+impl Cli {
+    pub fn fixture_path(&self, stem: &str, extension: &str) -> PathBuf {
+        let directory = self
+            .suite
+            .as_deref()
+            .and_then(|suite| suite.parent())
+            .unwrap_or_else(|| std::path::Path::new(""));
+        // Append instead of replacing an existing extension in the stem.
+        directory.join(format!("{stem}.{extension}"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

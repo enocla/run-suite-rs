@@ -13,12 +13,11 @@ cargo build --release
 ./target/release/runSuite --help
 ```
 
-Run from the directory containing your test fixtures. For example, from the
+Test fixtures are read relative to the suite file. For example, from the
 coursework root:
 
 ```sh
-cd working/a2/q3
-../../../run-suite-rs/target/release/runSuite suiteq3.txt ./a2q3-exec
+runSuite working/a2/q3/suiteq3.txt ./working/a2/q3/a2q3-exec
 ```
 
 You can also run test stems directly, without creating or specifying a suite file:
@@ -30,7 +29,7 @@ runSuite ./a2q3-exec --test test1 --test tests/nested.case
 
 Repeat `--test` (or `-t`) for a set of tests. Supply stems without companion
 extensions such as `.out`; the usual fixture files are loaded from the current
-working directory. Direct tests run in the order supplied, including repeats.
+working directory. Direct tests are reported in the order supplied, including repeats.
 `--test` cannot be combined with a suite file. All other options apply as usual.
 
 Example output excerpt with `--diff-tool builtin` (headings, test names, diagnostics,
@@ -66,9 +65,13 @@ test1 test2
 tests/nested.case
 ```
 
-Stems and paths passed to the tested program are relative to the **current
-working directory**, even if the suite itself is elsewhere. An existing stem
-extension is preserved: `nested.case` uses `nested.case.out`.
+Relative stems are resolved from the **suite file's directory**. For example,
+`tests/suite.txt` containing `one` reads `tests/one.out`, `tests/one.in`, and the
+other companion files from `tests/`. Absolute stems are used as given. An
+existing stem extension is preserved: `nested.case` uses `nested.case.out`.
+With `--test` and no suite file, stems are relative to the current working
+directory. Executable paths and paths passed as program arguments remain
+relative to the current working directory.
 
 | Companion file | Meaning |
 | --- | --- |
@@ -97,16 +100,23 @@ An executable can be an explicit path, a bare local name, or a command on `PATH`
 | `--filter PATTERN` | Select test stems containing any supplied pattern; repeat for a set. |
 | `--filter NAME --exact` | Match each supplied filter against the entire stem. |
 | `--list` | List selected tests without validating or running the executable. |
-| `--fail-fast` | Stop at the first failure; count remaining selected tests as skipped. |
+| `-j N`, `--jobs N` | Run at most N tests in parallel (default: 50); use 1 for sequential execution. |
+| `--fail-fast` | Report through the first failure in suite order; count later selected tests as skipped. |
 | `--nocapture` | Also show captured stdout/stderr for passing tests. |
 | `-q`, `--quiet` | Use progress dots and `F` marks, retaining failure details and summaries. |
 | `--timeout SECONDS` | Per-test limit, supporting fractional seconds; no limit by default. |
 | `--color auto\|always\|never` | Auto colors terminal output unless `NO_COLOR` is set or `TERM=dumb`. |
 | `--diff-tool COMMAND` | Failure renderer; `auto` (default) tries delta, Git, then system diff. Use `builtin` or a quoted command to override. |
 
-Tests run sequentially in suite order, including repeated stems. Passing output
-is hidden by default. Failure reports escape terminal control characters and
-invalid UTF-8. Comparison always uses the complete, original bytes. Built-in
+Tests run in parallel with up to 50 concurrent tests by default, including
+repeated stems. Results and failure details are always reported in suite order.
+Use `--jobs 1` for tests that share files or otherwise need sequential execution.
+With `--fail-fast`, any completed failure stops new tests from being scheduled.
+Earlier tests finish so the reported failure is the first in suite order, even
+if a later test failed sooner. Already running tests finish; results after the
+first failure in suite order are omitted and counted as skipped.
+Passing output is hidden by default. Failure reports escape terminal control
+characters and invalid UTF-8. Comparison always uses the complete, original bytes. Built-in
 output blocks show the full output and mark missing final newlines. Built-in
 expected and actual blocks include right-aligned line numbers starting at 1.
 Every failed
@@ -238,7 +248,8 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The integration tests cover real child processes, colored/plain reports,
+The integration tests cover suite-relative fixtures, parallel execution limits,
+ordered results and fail-fast behavior, real child processes, colored/plain reports,
 quoting and literal shell characters, input, byte-exact output, stderr/status,
 signals, malformed fixtures, filtering, listing, fail-fast, quiet/nocapture,
 timeouts and descendant cleanup, large output capture, and Valgrind integration.

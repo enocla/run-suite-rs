@@ -610,6 +610,127 @@ fn fail_fast_counts_unrun_tests_as_skipped() {
     assert!(!stdout(&output).contains("test two ..."));
 }
 
+fn check_parallel_limit(flags: &[&str], jobs: usize) {
+    let suite = Suite::new(
+        "touch \"started-$1\"\nwhile [ ! -f release ]; do sleep 0.01; done\nif [ \"$1\" = case0 ]; then sleep 0.1; fi\nprintf 'hello\\n'",
+    );
+    let stems: Vec<_> = (0..jobs + 1).map(|i| format!("case{i}")).collect();
+    suite.write("suite", stems.join("\n"));
+    for stem in &stems {
+        suite.write(&format!("{stem}.args"), stem);
+        suite.write(&format!("{stem}.out"), "hello\n");
+    }
+    let child = suite
+        .command()
+        .args(flags)
+        .args(["suite", "program", "--timeout", "5"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started_count = || {
+        fs::read_dir(suite.dir.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("started-")
+            })
+            .count()
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while started_count() < jobs && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // All active tests wait at the gate, so no worker can start another test.
+    std::thread::sleep(Duration::from_millis(50));
+    let active = started_count();
+    suite.write("release", "");
+    let output = child.wait_with_output().unwrap();
+    status(&output, 0);
+    assert_eq!(active, jobs);
+    assert_eq!(started_count(), stems.len());
+    let text = stdout(&output);
+    let reported: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("test case"))
+        .map(|line| line.split_once(" ... ok").unwrap().0)
+        .collect();
+    let expected: Vec<_> = (0..stems.len()).map(|i| i.to_string()).collect();
+    assert_eq!(reported, expected);
+}
+
+#[test]
+fn parallel_default_is_fifty_and_reports_in_suite_order() {
+    check_parallel_limit(&[], 50);
+}
+
+#[test]
+fn jobs_option_limits_parallel_execution() {
+    check_parallel_limit(&["--jobs", "2"], 2);
+}
+
+#[test]
+fn one_job_executes_tests_sequentially_in_suite_order() {
+    let suite = Suite::new("printf '%s\\n' \"$1\" >> order\nprintf 'hello\\n'");
+    suite.write("suite", "three one two one\n");
+    for stem in ["one", "two", "three"] {
+        suite.write(&format!("{stem}.args"), stem);
+        suite.write(&format!("{stem}.out"), "hello\n");
+    }
+    status(&suite.run(&["-j", "1"]), 0);
+    assert_eq!(
+        fs::read_to_string(suite.dir.path().join("order")).unwrap(),
+        "three\none\ntwo\none\n"
+    );
+}
+
+#[test]
+fn parallel_fail_fast_reports_the_first_failure_in_suite_order() {
+    for first_fails in [false, true] {
+        let suite = Suite::new(
+            r#"
+case "$1" in
+    one|two)
+        while [ ! -f third-failed ]; do sleep 0.01; done
+        sleep 0.15
+        printf 'hello\n'
+        exit "$2"
+        ;;
+    three) touch third-failed; exit 7 ;;
+    four) touch should-not-run; printf 'hello\n' ;;
+esac
+"#,
+        );
+        suite.write("suite", "one two three four\n");
+        suite.write("one.args", if first_fails { "one 7" } else { "one 0" });
+        suite.write("two.args", "two 7");
+        suite.write("three.args", "three");
+        suite.write("four.args", "four");
+        for stem in ["two", "three", "four"] {
+            suite.write(&format!("{stem}.out"), "hello\n");
+        }
+        let output = suite.run(&["-j", "3", "--fail-fast", "--timeout", "2"]);
+        status(&output, 1);
+        let text = stdout(&output);
+        if first_fails {
+            assert!(text.contains("test one ... FAILED"));
+            assert!(!text.contains("test two ..."));
+            assert!(text.contains("0 passed; 1 failed; 0 filtered out; 3 skipped"));
+        } else {
+            assert!(text.contains("test one ... ok"));
+            assert!(text.contains("test two ... FAILED"));
+            assert!(text.contains("1 passed; 1 failed; 0 filtered out; 2 skipped"));
+        }
+        assert!(!text.contains("test three ..."));
+        assert!(!text.contains("test four ..."));
+        assert!(!suite.dir.path().join("should-not-run").exists());
+    }
+}
+
 #[test]
 fn quiet_and_nocapture_preserve_summary_and_output() {
     let suite = Suite::new("printf 'hello\\n'\nprintf 'warning\\n' >&2");
@@ -828,14 +949,86 @@ fn unavailable_or_failing_diff_tools_fall_back_to_builtin() {
 }
 
 #[test]
-fn absolute_suite_path_keeps_stems_relative_to_working_directory() {
+fn absolute_suite_path_resolves_fixtures_relative_to_suite() {
     let suite = Suite::new("printf 'hello\\n'");
     let suites = tempfile::tempdir().unwrap();
     fs::write(suites.path().join("suite"), "one\n").unwrap();
+    fs::write(suites.path().join("one.out"), "hello\n").unwrap();
+    suite.write("one.out", "wrong directory\n");
     let output = suite
         .command()
         .arg(suites.path().join("suite"))
         .arg("program")
+        .output()
+        .unwrap();
+    status(&output, 0);
+    assert!(stdout(&output).contains("test one ... ok"));
+}
+
+#[test]
+fn relative_suite_path_resolves_all_companion_files_and_preserves_test_names() {
+    let suite = Suite::new("cat \"$1\"\ncat\nprintf 'warning\\n' >&2\nexit 7");
+    fs::create_dir_all(suite.dir.path().join("suite files/nested")).unwrap();
+    suite.write("suite files/suite", "nested/one.case missing\n");
+    suite.write("suite files/nested/one.case.args", "'program input'\n");
+    suite.write("suite files/nested/one.case.in", "stdin\n");
+    suite.write("suite files/nested/one.case.out", "argument input\nstdin\n");
+    suite.write("suite files/nested/one.case.err", "warning\n");
+    suite.write("suite files/nested/one.case.ret", "7\n");
+    suite.write("program input", "argument input\n");
+    let output = suite
+        .command()
+        .args([
+            "suite files/suite",
+            "./program",
+            "-e",
+            "--filter",
+            "nested/one.case",
+            "--exact",
+        ])
+        .output()
+        .unwrap();
+    status(&output, 0);
+    assert!(stdout(&output).contains("test nested/one.case ... ok"));
+    assert!(stdout(&output).contains("1 passed; 0 failed; 1 filtered out"));
+    let listed = suite
+        .command()
+        .args(["suite files/suite", "absent", "--list"])
+        .output()
+        .unwrap();
+    status(&listed, 0);
+    assert_eq!(
+        stdout(&listed),
+        "nested/one.case: test\nmissing: test\n\n2 tests; 0 filtered out\n"
+    );
+}
+
+#[test]
+fn missing_suite_relative_fixture_does_not_fall_back_to_working_directory() {
+    let suite = Suite::new("touch ran\nprintf 'hello\\n'");
+    fs::create_dir(suite.dir.path().join("tests")).unwrap();
+    suite.write("tests/suite", "one\n");
+    let output = suite
+        .command()
+        .args(["tests/suite", "program"])
+        .output()
+        .unwrap();
+    status(&output, 1);
+    assert!(stdout(&output).contains("cannot read tests/one.out"));
+    assert!(!suite.dir.path().join("ran").exists());
+}
+
+#[test]
+fn absolute_stems_are_preserved_in_a_nested_suite() {
+    let suite = Suite::new("printf 'hello\\n'");
+    fs::create_dir(suite.dir.path().join("tests")).unwrap();
+    suite.write(
+        "tests/suite",
+        format!("{}\n", suite.dir.path().join("one").display()),
+    );
+    let output = suite
+        .command()
+        .args(["tests/suite", "program"])
         .output()
         .unwrap();
     status(&output, 0);
@@ -865,6 +1058,9 @@ fn configuration_and_clap_errors_use_exit_two() {
     }
     for timeout in ["0", "-1", "NaN", "inf", "abc", "1e100"] {
         status(&suite.run(&["--timeout", timeout]), 2);
+    }
+    for jobs in ["0", "-1", "abc"] {
+        status(&suite.run(&["--jobs", jobs]), 2);
     }
     status(&suite.command().arg("--help").output().unwrap(), 0);
 }

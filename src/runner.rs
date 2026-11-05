@@ -6,6 +6,10 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -85,11 +89,6 @@ fn executable(path: &Path) -> bool {
     }
 }
 
-fn companion(stem: &str, extension: &str) -> PathBuf {
-    // Append instead of replacing an existing extension in the stem.
-    PathBuf::from(format!("{stem}.{extension}"))
-}
-
 fn required(path: &Path) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))
 }
@@ -111,34 +110,46 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn load(stem: &str, check_stderr: bool) -> Result<Self, String> {
-        let stdout = required(&companion(stem, "out"))?;
-        let args = match optional(&companion(stem, "args"))? {
+    fn load(stem: &str, cli: &Cli) -> Result<Self, String> {
+        let stdout = required(&cli.fixture_path(stem, "out"))?;
+        let args_path = cli.fixture_path(stem, "args");
+        let args = match optional(&args_path)? {
             None => Vec::new(),
             Some(bytes) => {
-                let text =
-                    String::from_utf8(bytes).map_err(|_| format!("{stem}.args is not UTF-8"))?;
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| format!("{} is not UTF-8", args_path.display()))?;
                 if text.contains('\0') {
-                    return Err(format!("{stem}.args contains a NUL byte"));
+                    return Err(format!("{} contains a NUL byte", args_path.display()));
                 }
-                shlex::split(&text)
-                    .ok_or_else(|| format!("{stem}.args contains an unfinished quote or escape"))?
+                shlex::split(&text).ok_or_else(|| {
+                    format!(
+                        "{} contains an unfinished quote or escape",
+                        args_path.display()
+                    )
+                })?
             }
         };
-        let input = match File::open(companion(stem, "in")) {
+        let input_path = cli.fixture_path(stem, "in");
+        let input = match File::open(&input_path) {
             Ok(file) if file.metadata().map_err(|err| err.to_string())?.is_file() => Some(file),
-            Ok(_) => return Err(format!("{stem}.in is not a regular file")),
+            Ok(_) => return Err(format!("{} is not a regular file", input_path.display())),
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-            Err(err) => return Err(format!("cannot read {stem}.in: {err}")),
+            Err(err) => return Err(format!("cannot read {}: {err}", input_path.display())),
         };
-        let (stderr, exit_code) = if check_stderr {
-            let stderr = required(&companion(stem, "err"))?;
-            let ret = required(&companion(stem, "ret"))?;
+        let (stderr, exit_code) = if cli.check_stderr {
+            let stderr = required(&cli.fixture_path(stem, "err"))?;
+            let ret_path = cli.fixture_path(stem, "ret");
+            let ret = required(&ret_path)?;
             let code: i32 = std::str::from_utf8(&ret)
                 .ok()
                 .and_then(|text| text.trim().parse().ok())
                 .filter(|code| (0..=255).contains(code))
-                .ok_or_else(|| format!("{stem}.ret must contain an integer from 0 to 255"))?;
+                .ok_or_else(|| {
+                    format!(
+                        "{} must contain an integer from 0 to 255",
+                        ret_path.display()
+                    )
+                })?;
             (Some(stderr), Some(code))
         } else {
             (None, None)
@@ -153,7 +164,62 @@ impl Fixture {
     }
 }
 
-pub fn run_test(stem: &str, program: &Path, cli: &Cli) -> TestResult {
+pub fn run_tests(
+    stems: &[String],
+    program: &Path,
+    cli: &Cli,
+    mut report: impl FnMut(&TestResult),
+) -> Vec<TestResult> {
+    let next = AtomicUsize::new(0);
+    let stopped = AtomicBool::new(false);
+    let (sender, receiver) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..cli.jobs.get().min(stems.len()) {
+            let sender = sender.clone();
+            let next = &next;
+            let stopped = &stopped;
+            scope.spawn(move || {
+                while !stopped.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(stem) = stems.get(index) else {
+                        break;
+                    };
+                    let result = run_test(stem, program, cli);
+                    if cli.fail_fast && !result.passed() {
+                        stopped.store(true, Ordering::Relaxed);
+                    }
+                    if sender.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        let mut pending: Vec<Option<TestResult>> =
+            std::iter::repeat_with(|| None).take(stems.len()).collect();
+        let mut results = Vec::new();
+        for (index, result) in receiver {
+            pending[index] = Some(result);
+            // Workers claim indices in order, so every test preceding a failure
+            // is already scheduled. Wait for those tests before reporting it.
+            while let Some(result) = pending[results.len()].take() {
+                let failed = !result.passed();
+                report(&result);
+                results.push(result);
+                if cli.fail_fast && failed {
+                    return results;
+                }
+                if results.len() == stems.len() {
+                    break;
+                }
+            }
+        }
+        results
+    })
+}
+
+fn run_test(stem: &str, program: &Path, cli: &Cli) -> TestResult {
     let start = Instant::now();
     let mut result = TestResult {
         name: stem.to_owned(),
@@ -173,7 +239,7 @@ pub fn run_test(stem: &str, program: &Path, cli: &Cli) -> TestResult {
 }
 
 fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Result<(), String> {
-    let fixture = Fixture::load(stem, cli.check_stderr)?;
+    let fixture = Fixture::load(stem, cli)?;
     result.args.clone_from(&fixture.args);
     result.has_input = fixture.input.is_some();
     result.fixture_loaded = true;

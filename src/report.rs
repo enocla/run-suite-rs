@@ -171,12 +171,21 @@ impl Reporter {
         if !result.fixture_loaded {
             // Invalid fixtures cannot supply a faithful direct program invocation.
             let runner = env::current_exe().unwrap_or_else(|_| "runSuite".into());
-            let mut command = format!(
-                "{} {} --test {}",
-                self.shell.path(&runner),
-                self.shell.path(program),
-                self.shell.quote(&result.name)
-            );
+            let mut command = match &cli.suite {
+                Some(suite) => format!(
+                    "{} {} {} --filter {} --exact",
+                    self.shell.path(&runner),
+                    self.shell.path(suite),
+                    self.shell.path(program),
+                    self.shell.quote(&result.name)
+                ),
+                None => format!(
+                    "{} {} --test {}",
+                    self.shell.path(&runner),
+                    self.shell.path(program),
+                    self.shell.quote(&result.name)
+                ),
+            };
             if cli.check_stderr {
                 command.push_str(" -e");
             }
@@ -200,7 +209,7 @@ impl Reporter {
             );
         }
         let input = if result.has_input {
-            fixture_path(self.shell, &result.name, "in")
+            fixture_path(self.shell, cli, &result.name, "in")
         } else {
             "/dev/null".into()
         };
@@ -233,7 +242,7 @@ impl Reporter {
         if cli.check_stderr {
             lines.push(format!(
                 "  printf 'expected exit status: '; cat -- {}",
-                fixture_path(self.shell, &result.name, "ret")
+                fixture_path(self.shell, cli, &result.name, "ret")
             ));
         }
         for (stream, extension) in [("stdout", "out"), ("stderr", "err")] {
@@ -242,7 +251,7 @@ impl Reporter {
             }
             let files = format!(
                 "-- {} \"$capture/{stream}\"",
-                fixture_path(self.shell, &result.name, extension)
+                fixture_path(self.shell, cli, &result.name, extension)
             );
             let diff = match &self.diff_tool {
                 DiffTool::Auto if fish => format!(
@@ -363,12 +372,12 @@ impl Reporter {
     }
 }
 
-fn fixture_path(shell: Shell, stem: &str, extension: &str) -> String {
-    let path = format!("{stem}.{extension}");
-    shell.quote(&if Path::new(&path).is_absolute() {
+fn fixture_path(shell: Shell, cli: &Cli, stem: &str, extension: &str) -> String {
+    let path = cli.fixture_path(stem, extension);
+    shell.path(&if path.is_absolute() {
         path
     } else {
-        format!("./{path}")
+        Path::new(".").join(path)
     })
 }
 
