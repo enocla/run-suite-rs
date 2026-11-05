@@ -1,8 +1,11 @@
+mod capture;
 mod cli;
 mod diff;
 mod report;
 mod runner;
 mod shell;
+#[cfg(unix)]
+mod watchdog;
 
 use clap::Parser;
 use cli::Cli;
@@ -10,6 +13,8 @@ use report::Reporter;
 use std::{process::ExitCode, time::Instant};
 
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    watchdog::enter_if_requested();
     let cli = Cli::parse();
     match run(&cli) {
         Ok(passed) => ExitCode::from(if passed { 0 } else { 1 }),

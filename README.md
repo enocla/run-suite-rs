@@ -104,7 +104,8 @@ An executable can be an explicit path, a bare local name, or a command on `PATH`
 | `--fail-fast` | Report through the first failure in suite order; count later selected tests as skipped. |
 | `--nocapture` | Also show captured stdout/stderr for passing tests. |
 | `-q`, `--quiet` | Use progress dots and `F` marks, retaining failure details and summaries. |
-| `--timeout SECONDS` | Per-test limit, supporting fractional seconds; no limit by default. |
+| `--timeout SECONDS` | Per-test limit, supporting fractional seconds; default: 0.5 seconds (500 ms), including Valgrind. |
+| `--max-output-bytes BYTES` | Maximum captured bytes per stream; default: 1048576 (1 MiB). Exceeding the limit fails the test. |
 | `--color auto\|always\|never` | Auto colors terminal output unless `NO_COLOR` is set or `TERM=dumb`. |
 | `--diff-tool COMMAND` | Failure renderer; `auto` (default) tries delta, Git, then system diff. Use `builtin` or a quoted command to override. |
 
@@ -116,11 +117,14 @@ Earlier tests finish so the reported failure is the first in suite order, even
 if a later test failed sooner. Already running tests finish; results after the
 first failure in suite order are omitted and counted as skipped.
 Passing output is hidden by default. Failure reports escape terminal control
-characters and invalid UTF-8. Comparison always uses the complete, original bytes. Built-in
-output blocks show the full output and mark missing final newlines. Built-in
+characters and invalid UTF-8. Within the output limit, comparison uses the
+complete, original bytes. Built-in output blocks show the full output and mark
+missing final newlines. Built-in
 expected and actual blocks include right-aligned line numbers starting at 1.
 Every failed
-test shows its complete captured stderr, including when stderr also has a diff.
+test shows its captured stderr, including when stderr also has a diff. Output-limit
+failures retain only the first `--max-output-bytes` bytes per stream and identify
+which stream was truncated.
 
 Each failure also prints a copyable **to reproduce** command block for the
 detected shell. The runner checks its parent processes for the active shell,
@@ -190,10 +194,22 @@ Exit codes: **0** for all selected tests passing, **1** for any test failure,
 nonzero program exit is a failure. With `-e`, the specified nonzero exit may
 pass; Unix signals use shell status `128 + signal` for comparison.
 
-Capture uses temporary files to avoid stdout/stderr pipe deadlocks. Temporary
-files are removed automatically. On Unix, a timeout kills the test's process
-group, including descendants that remain in that group. On other platforms it
-kills the immediate child. A timed-out test retains partial output for diagnosis.
+Stdout and stderr are drained concurrently through pipes into bounded memory;
+they are never spooled to temporary files. Each stream is limited to 1 MiB by
+default, even when stderr comparison is disabled. On Unix the separate Valgrind
+log also uses a bounded pipe, so it cannot fill temporary storage. Increase the
+limit with `--max-output-bytes BYTES` when larger output is expected. A test that
+exceeds a capture limit fails and retains the captured prefix for diagnosis.
+
+Tests time out after 500 ms by default, including time spent in Valgrind. Use
+`--timeout SECONDS` to allow a longer run. Timed-out tests retain partial output.
+On Unix, each test has a separate watchdog process that kills its process group
+on timeout, output overflow, normal program exit, or runner termination, including
+`SIGKILL`. The watchdog also removes temporary capture resources if the runner
+cannot run cleanup. Descendants that deliberately leave the process group (for
+example with `setsid`) are outside this cleanup guarantee. On other platforms,
+timeouts and output overflow stop the immediate child; the Unix watchdog and
+bounded Valgrind log are unavailable.
 
 Valgrind must be installed and available on `PATH` for `-v`. Its log is separate
 from target stderr. The runner reads `ERROR SUMMARY` and preserves the target's
@@ -252,9 +268,11 @@ The integration tests cover suite-relative fixtures, parallel execution limits,
 ordered results and fail-fast behavior, real child processes, colored/plain reports,
 quoting and literal shell characters, input, byte-exact output, stderr/status,
 signals, malformed fixtures, filtering, listing, fail-fast, quiet/nocapture,
-timeouts and descendant cleanup, large output capture, and Valgrind integration.
-Valgrind tests use a controlled executable substitute; real Valgrind was not
-available in the development environment.
+default and custom timeouts, descendant cleanup after successful exit and runner
+SIGKILL, exact output-limit boundaries, endless stdout/stderr, bounded Valgrind
+logs, large output capture, and Valgrind integration.
+Valgrind integration tests use a controlled executable substitute. A manual
+smoke test with real Valgrind also verified capture through the log pipe.
 
 Both the original and Rust runner also passed the 25-test suite in
 `working/a2/q3/suiteq3.txt` against `a2q3-exec`.

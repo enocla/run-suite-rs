@@ -64,9 +64,13 @@ pub struct Cli {
     #[arg(short, long)]
     pub quiet: bool,
 
-    /// Maximum seconds per test, including Valgrind (default: no limit)
-    #[arg(long, value_name = "SECONDS", value_parser = parse_timeout)]
-    pub timeout: Option<Duration>,
+    /// Maximum seconds per test, including Valgrind
+    #[arg(long, value_name = "SECONDS", default_value = "0.5", value_parser = parse_timeout)]
+    pub timeout: Duration,
+
+    /// Maximum captured bytes per stream (stdout, stderr, and Valgrind log)
+    #[arg(long, value_name = "BYTES", default_value = "1048576")]
+    pub max_output_bytes: NonZeroUsize,
 
     /// Color mode; auto respects terminals and NO_COLOR
     #[arg(long, value_enum, default_value = "auto")]

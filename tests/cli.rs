@@ -1062,6 +1062,9 @@ fn configuration_and_clap_errors_use_exit_two() {
     for jobs in ["0", "-1", "abc"] {
         status(&suite.run(&["--jobs", jobs]), 2);
     }
+    for limit in ["0", "-1", "abc", "18446744073709551616"] {
+        status(&suite.run(&["--max-output-bytes", limit]), 2);
+    }
     status(&suite.command().arg("--help").output().unwrap(), 0);
 }
 
@@ -1127,4 +1130,178 @@ fn valgrind_missing_or_incomplete_log_is_reported() {
         .unwrap();
     status(&output, 1);
     assert!(stdout(&output).contains("install valgrind or omit -v"));
+}
+
+#[test]
+fn default_timeout_stops_a_spinlock_and_keeps_partial_output() {
+    let suite = Suite::new("printf 'partial\\n'\nwhile :; do :; done");
+    let started = Instant::now();
+    let output = suite.run(&[]);
+    status(&output, 1);
+    assert!(stdout(&output).contains("timed out after 500ms"));
+    assert!(stdout(&output).contains("partial"));
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn explicit_timeout_can_extend_the_default() {
+    let suite = Suite::new("sleep 0.65\nprintf 'hello\\n'");
+    status(&suite.run(&["--timeout", "2"]), 0);
+}
+
+#[test]
+fn output_limit_allows_exactly_the_limit_and_rejects_the_next_byte() {
+    for stream in ["stdout", "stderr"] {
+        let redirect = if stream == "stdout" { "" } else { ">&2" };
+        let suite = Suite::new(&format!("printf '12345678' {redirect}"));
+        suite.write("one.out", if stream == "stdout" { "12345678" } else { "" });
+        suite.write("one.err", if stream == "stderr" { "12345678" } else { "" });
+        suite.write("one.ret", "0\n");
+        status(&suite.run(&["-e", "--max-output-bytes", "8"]), 0);
+        suite.script("program", &format!("printf '123456789' {redirect}"));
+        let output = suite.run(&["-e", "--max-output-bytes", "8"]);
+        status(&output, 1);
+        assert!(stdout(&output).contains(&format!("{stream} exceeded output limit of 8 bytes")));
+        assert!(stdout(&output).contains("12345678"));
+        assert!(!stdout(&output).contains("123456789"));
+    }
+}
+
+#[test]
+fn endless_stdout_and_stderr_fail_promptly_with_bounded_capture() {
+    for redirect in ["", ">&2"] {
+        let suite = Suite::new(&format!(
+            "(sleep 0.8; touch survived) &\nwhile :; do printf 'xxxxxxxxxxxxxxxx' {redirect}; done"
+        ));
+        let temporary = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let output = suite
+            .command()
+            .env("TMPDIR", temporary.path())
+            .args([
+                "suite",
+                "program",
+                "--max-output-bytes",
+                "4096",
+                "--timeout",
+                "5",
+            ])
+            .output()
+            .unwrap();
+        status(&output, 1);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(stdout(&output).contains("exceeded output limit of 4096 bytes"));
+        assert!(!stdout(&output).contains("timed out"));
+        assert!(output.stdout.len() < 6000);
+        assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(!suite.dir.path().join("survived").exists());
+    }
+}
+
+#[test]
+fn default_output_limit_is_one_mebibyte() {
+    let suite = Suite::new("head -c 1048577 /dev/zero | tr '\\000' x");
+    let output = suite.run(&[]);
+    status(&output, 1);
+    assert!(stdout(&output).contains("stdout exceeded output limit of 1048576 bytes"));
+}
+
+#[test]
+fn successful_program_exit_still_cleans_up_descendants() {
+    let suite = Suite::new("(sleep 0.8; touch survived) &\nprintf 'hello\\n'");
+    status(&suite.run(&[]), 0);
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(!suite.dir.path().join("survived").exists());
+}
+
+#[test]
+fn sigkill_of_runner_kills_children_and_removes_capture_resources() {
+    use std::process::Stdio;
+    let suite = Suite::new(
+        "trap '' TERM\n(sleep 1.2; touch survived-$1) &\necho $! > descendant-$1.pid\necho $$ > parent-$1.pid\nwait",
+    );
+    suite.write("suite", "one two three\n");
+    for stem in ["one", "two", "three"] {
+        suite.write(&format!("{stem}.args"), stem);
+        suite.write(&format!("{stem}.out"), "");
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let mut runner = suite
+        .command()
+        .env("TMPDIR", temporary.path())
+        .args(["suite", "program", "--timeout", "10"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while ["one", "two", "three"]
+        .iter()
+        .any(|stem| !suite.dir.path().join(format!("parent-{stem}.pid")).exists())
+    {
+        if started.elapsed() > Duration::from_secs(3) {
+            let _ = runner.kill();
+            let _ = runner.wait();
+            panic!("test program did not start");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    runner.kill().unwrap(); // SIGKILL: the runner cannot execute cleanup code.
+    runner.wait().unwrap();
+    let started = Instant::now();
+    while fs::read_dir(temporary.path()).unwrap().count() != 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "watchdog did not clean up"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(1400));
+    for stem in ["one", "two", "three"] {
+        assert!(!suite.dir.path().join(format!("survived-{stem}")).exists());
+    }
+    #[cfg(target_os = "linux")]
+    for name in [
+        "parent-one.pid",
+        "descendant-one.pid",
+        "parent-two.pid",
+        "descendant-two.pid",
+        "parent-three.pid",
+        "descendant-three.pid",
+    ] {
+        let pid = fs::read_to_string(suite.dir.path().join(name)).unwrap();
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid.trim())) {
+            // A container's PID 1 may leave reparented zombies; they cannot run.
+            assert!(
+                stat.rsplit_once(") ").unwrap().1.starts_with('Z'),
+                "process still alive: {stat}"
+            );
+        }
+    }
+}
+
+#[test]
+fn valgrind_log_is_bounded_without_spooling_to_disk() {
+    let suite = Suite::new("printf 'hello\\n'");
+    suite.write("one.err", "");
+    suite.write("one.ret", "0\n");
+    mock_valgrind(&suite, "x".repeat(8192).as_str());
+    let output = valgrind_command(&suite)
+        .args(["--max-output-bytes", "4096"])
+        .output()
+        .unwrap();
+    status(&output, 1);
+    assert!(stdout(&output).contains("Valgrind log exceeded output limit of 4096 bytes"));
+    assert!(!stdout(&output).contains("did not produce an error summary"));
+}
+
+#[test]
+fn signaled_program_exit_still_cleans_up_descendants() {
+    let suite = Suite::new("(sleep 0.8; touch survived) &\nkill -KILL $$");
+    let output = suite.run(&[]);
+    status(&output, 1);
+    assert!(stdout(&output).contains("signal 9"));
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(!suite.dir.path().join("survived").exists());
 }

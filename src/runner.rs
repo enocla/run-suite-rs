@@ -1,4 +1,4 @@
-use crate::cli::Cli;
+use crate::{capture::Capture, cli::Cli};
 use std::{
     env,
     ffi::OsString,
@@ -245,9 +245,23 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
     result.fixture_loaded = true;
     let temporary =
         tempfile::tempdir().map_err(|err| format!("cannot create temporary directory: {err}"))?;
-    let stdout_path = temporary.path().join("stdout");
-    let stderr_path = temporary.path().join("stderr");
     let memory_path = temporary.path().join("valgrind.log");
+    let limit = cli.max_output_bytes.get();
+    #[cfg(unix)]
+    let mut memory_capture = if cli.valgrind {
+        Some(
+            Capture::start(
+                crate::capture::log_pipe(&memory_path).map_err(|err| err.to_string())?,
+                limit,
+            )
+            .map_err(|err| err.to_string())?,
+        )
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let watchdog = crate::watchdog::Watchdog::start(temporary.path())
+        .map_err(|err| format!("cannot start process watchdog: {err}"))?;
     let mut command = if cli.valgrind {
         let mut command = Command::new("valgrind");
         let mut log_file = OsString::from("--log-file=");
@@ -268,48 +282,94 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
     command
         .args(&fixture.args)
         .stdin(fixture.input.map_or_else(Stdio::null, Stdio::from))
-        .stdout(File::create(&stdout_path).map_err(|err| err.to_string())?)
-        .stderr(File::create(&stderr_path).map_err(|err| err.to_string())?);
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        command.process_group(watchdog.process_group());
     }
-    let mut child = command.spawn().map_err(|err| {
+    let child = command.spawn().map_err(|err| {
         if cli.valgrind && err.kind() == io::ErrorKind::NotFound {
             "cannot start Valgrind: install valgrind or omit -v".into()
         } else {
             format!("cannot start {}: {err}", program.display())
         }
     })?;
+    let mut child = ReapChild(child);
+    let mut stdout = Capture::start(child.0.stdout.take().unwrap(), limit)
+        .map_err(|err| format!("cannot capture stdout: {err}"))?;
+    let mut stderr = Capture::start(child.0.stderr.take().unwrap(), limit)
+        .map_err(|err| format!("cannot capture stderr: {err}"))?;
     let start = Instant::now();
     let (status, timed_out) = loop {
-        match child.try_wait() {
+        let mut exceeded = stdout.exceeded() || stderr.exceeded();
+        #[cfg(unix)]
+        {
+            exceeded |= memory_capture.as_ref().is_some_and(Capture::exceeded);
+        }
+        if exceeded {
+            stop(&mut child.0);
+            break (child.0.wait().map_err(|err| err.to_string())?, false);
+        }
+        match child.0.try_wait() {
             Ok(Some(status)) => break (status, false),
             Ok(None) => {}
             Err(err) => {
-                stop(&mut child);
+                stop(&mut child.0);
                 return Err(format!("cannot wait for program: {err}"));
             }
         }
-        if cli.timeout.is_some_and(|limit| start.elapsed() >= limit) {
-            stop(&mut child);
+        if start.elapsed() >= cli.timeout {
+            stop(&mut child.0);
             let status = child
+                .0
                 .wait()
                 .map_err(|err| format!("cannot reap timed-out program: {err}"))?;
             break (status, true);
         }
         thread::sleep(Duration::from_millis(5));
     };
-    // File-backed capture avoids pipe deadlocks, including when a child forks.
-    result.stdout = required(&stdout_path)?;
-    result.stderr = required(&stderr_path)?;
+    // Always kill remaining descendants, including after a successful parent
+    // exit, before draining the final buffered output.
+    #[cfg(unix)]
+    drop(watchdog);
+    result.stdout = stdout
+        .finish()
+        .map_err(|err| format!("cannot read stdout: {err}"))?;
+    result.stderr = stderr
+        .finish()
+        .map_err(|err| format!("cannot read stderr: {err}"))?;
+    #[cfg(unix)]
+    let log = memory_capture
+        .as_mut()
+        .map(Capture::finish)
+        .transpose()
+        .map_err(|err| format!("cannot read Valgrind log: {err}"))?
+        .unwrap_or_default();
+    #[cfg(not(unix))]
+    let log = optional(&memory_path)?.unwrap_or_default();
+    let mut limited = false;
+    let mut streams = vec![("stdout", stdout.exceeded()), ("stderr", stderr.exceeded())];
+    #[cfg(unix)]
+    streams.push((
+        "Valgrind log",
+        memory_capture.as_ref().is_some_and(Capture::exceeded),
+    ));
+    for (stream, exceeded) in streams {
+        if exceeded {
+            limited = true;
+            result.problems.push(Problem::Message(format!(
+                "{stream} exceeded output limit of {limit} bytes (capture truncated)"
+            )));
+        }
+    }
     if timed_out {
         result.problems.push(Problem::Message(format!(
             "timed out after {}",
-            crate::report::format_duration(cli.timeout.unwrap())
+            crate::report::format_duration(cli.timeout)
         )));
-    } else {
+    } else if !limited {
         compare(
             "stdout",
             fixture.stdout,
@@ -333,8 +393,7 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
             )));
         }
     }
-    if cli.valgrind && !timed_out {
-        let log = optional(&memory_path)?.unwrap_or_default();
+    if cli.valgrind && !timed_out && !limited {
         match valgrind_errors(&log) {
             Some(0) => {}
             Some(count) => {
@@ -350,6 +409,8 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
                 result.problems.push(Problem::Valgrind(log));
             }
         }
+    } else if cli.valgrind && !log.is_empty() {
+        result.problems.push(Problem::Valgrind(log));
     }
     Ok(())
 }
@@ -376,15 +437,16 @@ fn valgrind_errors(log: &[u8]) -> Option<u64> {
     })
 }
 
-fn stop(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        // The child was made the leader of its own process group at spawn.
-        // Kill descendants as well so a timeout cannot leave them running.
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
-        }
+// Rust's Child does not reap or stop a process on drop. Cover every error path.
+struct ReapChild(std::process::Child);
+
+impl Drop for ReapChild {
+    fn drop(&mut self) {
+        stop(&mut self.0);
     }
+}
+
+fn stop(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
