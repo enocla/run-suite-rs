@@ -1,0 +1,350 @@
+use crate::cli::Cli;
+use std::{
+    env,
+    ffi::OsString,
+    fs::{self, File},
+    io,
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+pub struct TestResult {
+    pub name: String,
+    pub elapsed: Duration,
+    pub problems: Vec<Problem>,
+    pub args: Vec<String>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub has_input: bool,
+    pub fixture_loaded: bool,
+}
+
+pub enum Problem {
+    Message(String),
+    Mismatch {
+        stream: &'static str,
+        expected: Vec<u8>,
+        actual: Vec<u8>,
+    },
+    Valgrind(Vec<u8>),
+}
+
+impl TestResult {
+    pub fn passed(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+pub fn load_suite(path: &Path) -> Result<Vec<String>, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|err| format!("cannot read suite {}: {err}", path.display()))?;
+    Ok(contents
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect())
+}
+
+pub fn resolve_program(program: &Path) -> Result<PathBuf, String> {
+    // A bare local name works even when '.' is absent from PATH.
+    if executable(program) {
+        return fs::canonicalize(program)
+            .map_err(|err| format!("cannot resolve {}: {err}", program.display()));
+    }
+    if program.components().count() == 1 {
+        for directory in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
+            let candidate = directory.join(program);
+            if executable(&candidate) {
+                return fs::canonicalize(&candidate)
+                    .map_err(|err| format!("cannot resolve {}: {err}", candidate.display()));
+            }
+        }
+    }
+    Err(format!(
+        "{} does not exist or is not executable",
+        program.display()
+    ))
+}
+
+fn executable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn companion(stem: &str, extension: &str) -> PathBuf {
+    // Append instead of replacing an existing extension in the stem.
+    PathBuf::from(format!("{stem}.{extension}"))
+}
+
+fn required(path: &Path) -> Result<Vec<u8>, String> {
+    fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))
+}
+
+fn optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("cannot read {}: {err}", path.display())),
+    }
+}
+
+struct Fixture {
+    args: Vec<String>,
+    input: Option<File>,
+    stdout: Vec<u8>,
+    stderr: Option<Vec<u8>>,
+    exit_code: Option<i32>,
+}
+
+impl Fixture {
+    fn load(stem: &str, check_stderr: bool) -> Result<Self, String> {
+        let stdout = required(&companion(stem, "out"))?;
+        let args = match optional(&companion(stem, "args"))? {
+            None => Vec::new(),
+            Some(bytes) => {
+                let text =
+                    String::from_utf8(bytes).map_err(|_| format!("{stem}.args is not UTF-8"))?;
+                if text.contains('\0') {
+                    return Err(format!("{stem}.args contains a NUL byte"));
+                }
+                shlex::split(&text)
+                    .ok_or_else(|| format!("{stem}.args contains an unfinished quote or escape"))?
+            }
+        };
+        let input = match File::open(companion(stem, "in")) {
+            Ok(file) if file.metadata().map_err(|err| err.to_string())?.is_file() => Some(file),
+            Ok(_) => return Err(format!("{stem}.in is not a regular file")),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(format!("cannot read {stem}.in: {err}")),
+        };
+        let (stderr, exit_code) = if check_stderr {
+            let stderr = required(&companion(stem, "err"))?;
+            let ret = required(&companion(stem, "ret"))?;
+            let code: i32 = std::str::from_utf8(&ret)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .filter(|code| (0..=255).contains(code))
+                .ok_or_else(|| format!("{stem}.ret must contain an integer from 0 to 255"))?;
+            (Some(stderr), Some(code))
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            args,
+            input,
+            stdout,
+            stderr,
+            exit_code,
+        })
+    }
+}
+
+pub fn run_test(stem: &str, program: &Path, cli: &Cli) -> TestResult {
+    let start = Instant::now();
+    let mut result = TestResult {
+        name: stem.to_owned(),
+        elapsed: Duration::ZERO,
+        problems: Vec::new(),
+        args: Vec::new(),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        has_input: false,
+        fixture_loaded: false,
+    };
+    if let Err(err) = execute(stem, program, cli, &mut result) {
+        result.problems.push(Problem::Message(err));
+    }
+    result.elapsed = start.elapsed();
+    result
+}
+
+fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Result<(), String> {
+    let fixture = Fixture::load(stem, cli.check_stderr)?;
+    result.args.clone_from(&fixture.args);
+    result.has_input = fixture.input.is_some();
+    result.fixture_loaded = true;
+    let temporary =
+        tempfile::tempdir().map_err(|err| format!("cannot create temporary directory: {err}"))?;
+    let stdout_path = temporary.path().join("stdout");
+    let stderr_path = temporary.path().join("stderr");
+    let memory_path = temporary.path().join("valgrind.log");
+    let mut command = if cli.valgrind {
+        let mut command = Command::new("valgrind");
+        let mut log_file = OsString::from("--log-file=");
+        log_file.push(&memory_path);
+        command
+            .args([
+                "--tool=memcheck",
+                "--leak-check=full",
+                "--show-leak-kinds=all",
+            ])
+            .arg(log_file)
+            .arg(program);
+        // Read ERROR SUMMARY instead of overriding the target's exit code.
+        command
+    } else {
+        Command::new(program)
+    };
+    command
+        .args(&fixture.args)
+        .stdin(fixture.input.map_or_else(Stdio::null, Stdio::from))
+        .stdout(File::create(&stdout_path).map_err(|err| err.to_string())?)
+        .stderr(File::create(&stderr_path).map_err(|err| err.to_string())?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|err| {
+        if cli.valgrind && err.kind() == io::ErrorKind::NotFound {
+            "cannot start Valgrind: install valgrind or omit -v".into()
+        } else {
+            format!("cannot start {}: {err}", program.display())
+        }
+    })?;
+    let start = Instant::now();
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) => {}
+            Err(err) => {
+                stop(&mut child);
+                return Err(format!("cannot wait for program: {err}"));
+            }
+        }
+        if cli.timeout.is_some_and(|limit| start.elapsed() >= limit) {
+            stop(&mut child);
+            let status = child
+                .wait()
+                .map_err(|err| format!("cannot reap timed-out program: {err}"))?;
+            break (status, true);
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    // File-backed capture avoids pipe deadlocks, including when a child forks.
+    result.stdout = required(&stdout_path)?;
+    result.stderr = required(&stderr_path)?;
+    if timed_out {
+        result.problems.push(Problem::Message(format!(
+            "timed out after {:.3}s",
+            cli.timeout.unwrap().as_secs_f64()
+        )));
+    } else {
+        compare(
+            "stdout",
+            fixture.stdout,
+            &result.stdout,
+            &mut result.problems,
+        );
+        if let Some(expected) = fixture.stderr {
+            compare("stderr", expected, &result.stderr, &mut result.problems);
+        }
+        if let Some(expected) = fixture.exit_code {
+            if shell_code(status) != expected {
+                result.problems.push(Problem::Message(format!(
+                    "exit status: expected {expected}, actual {}",
+                    status_text(status)
+                )));
+            }
+        } else if !status.success() {
+            result.problems.push(Problem::Message(format!(
+                "program exited with {}",
+                status_text(status)
+            )));
+        }
+    }
+    if cli.valgrind && !timed_out {
+        let log = optional(&memory_path)?.unwrap_or_default();
+        match valgrind_errors(&log) {
+            Some(0) => {}
+            Some(count) => {
+                result.problems.push(Problem::Message(format!(
+                    "Valgrind reported {count} memory error(s)"
+                )));
+                result.problems.push(Problem::Valgrind(log));
+            }
+            None => {
+                result.problems.push(Problem::Message(
+                    "Valgrind did not produce an error summary".into(),
+                ));
+                result.problems.push(Problem::Valgrind(log));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compare(stream: &'static str, expected: Vec<u8>, actual: &[u8], problems: &mut Vec<Problem>) {
+    if expected != actual {
+        problems.push(Problem::Mismatch {
+            stream,
+            expected,
+            actual: actual.to_vec(),
+        });
+    }
+}
+
+fn valgrind_errors(log: &[u8]) -> Option<u64> {
+    String::from_utf8_lossy(log).lines().rev().find_map(|line| {
+        let (_, suffix) = line.split_once("ERROR SUMMARY:")?;
+        suffix
+            .split_whitespace()
+            .next()?
+            .replace(',', "")
+            .parse()
+            .ok()
+    })
+}
+
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The child was made the leader of its own process group at spawn.
+        // Kill descendants as well so a timeout cannot leave them running.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn shell_code(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        128 + status.signal().unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        1
+    }
+}
+
+fn status_text(status: ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("signal {signal} (shell status {})", shell_code(status));
+        }
+    }
+    shell_code(status).to_string()
+}

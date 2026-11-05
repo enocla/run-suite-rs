@@ -1,0 +1,17 @@
+[package]
+name = "run-suite"
+version = "0.1.0"
+edition = "2024"
+description = "A cargo-test-style runner for CS246 test suites"
+
+[[bin]]
+name = "runSuite"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+shlex = "2"
+tempfile = "3.27"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
