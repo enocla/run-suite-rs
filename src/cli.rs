@@ -64,8 +64,14 @@ pub struct Cli {
     #[arg(short, long)]
     pub quiet: bool,
 
-    /// Maximum seconds per test, including Valgrind
-    #[arg(long, value_name = "SECONDS", default_value = "0.5", value_parser = parse_timeout)]
+    /// Maximum seconds per test (default: 0.5, or 10 with --valgrind)
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value = "0.5",
+        default_value_if("valgrind", "true", Some("10")),
+        value_parser = parse_timeout
+    )]
     pub timeout: Duration,
 
     /// Maximum captured bytes per stream (stdout, stderr, and Valgrind log)
@@ -110,4 +116,24 @@ fn parse_timeout(value: &str) -> Result<Duration, String> {
         return Err("timeout must be greater than zero".into());
     }
     Ok(duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_defaults_depend_on_valgrind_and_explicit_values_take_priority() {
+        for (flags, seconds) in [
+            (vec![], 0.5),
+            (vec!["-v"], 10.0),
+            (vec!["--valgrind"], 10.0),
+            (vec!["--timeout", "2"], 2.0),
+            (vec!["-v", "--timeout", "20"], 20.0),
+            (vec!["--timeout", "0.25", "-v"], 0.25),
+        ] {
+            let cli = Cli::parse_from(["runSuite", "suite", "program"].into_iter().chain(flags));
+            assert_eq!(cli.timeout, Duration::from_secs_f64(seconds));
+        }
+    }
 }

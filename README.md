@@ -104,7 +104,7 @@ An executable can be an explicit path, a bare local name, or a command on `PATH`
 | `--fail-fast` | Report through the first failure or timeout in suite order; count later selected tests as skipped. |
 | `--nocapture` | Also show captured stdout/stderr for passing tests. |
 | `-q`, `--quiet` | Use progress dots, `F` for failures, and `T` for timeouts, retaining details and summaries. |
-| `--timeout SECONDS` | Per-test limit, supporting fractional seconds; default: 0.5 seconds (500 ms), including Valgrind. |
+| `--timeout SECONDS` | Per-test limit, supporting fractional seconds; default: 0.5 seconds (500 ms), or 10 seconds with `-v`/`--valgrind`. |
 | `--max-output-bytes BYTES` | Maximum captured bytes per stream; default: 1048576 (1 MiB). Exceeding the limit fails the test. |
 | `--color auto\|always\|never` | Auto colors terminal output unless `NO_COLOR` is set or `TERM=dumb`. |
 | `--diff-tool COMMAND` | Failure renderer; `auto` (default) tries delta, Git, then system diff. Use `builtin` or a quoted command to override. |
@@ -203,8 +203,9 @@ log also uses a bounded pipe, so it cannot fill temporary storage. Increase the
 limit with `--max-output-bytes BYTES` when larger output is expected. A test that
 exceeds a capture limit fails and retains the captured prefix for diagnosis.
 
-Tests time out after 500 ms by default, including time spent in Valgrind. Use
-`--timeout SECONDS` to allow a longer run. Timeouts appear as yellow `TIMEOUT`
+Tests time out after 500 ms by default, or 10 seconds with `-v`/`--valgrind`,
+including time spent in Valgrind. An explicit `--timeout SECONDS` overrides
+either default. Timeouts appear as yellow `TIMEOUT`
 results (`T` in quiet mode), with a separate `timeouts:` list and `timed out`
 summary count. They are excluded from the `failed` count but still cause exit
 status 1 and trigger `--fail-fast`. If only timeouts prevent success, the overall
