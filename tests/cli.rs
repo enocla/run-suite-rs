@@ -157,13 +157,7 @@ fn failed_program_shows_full_stderr_beyond_old_byte_and_line_limits() {
         let output = suite.run(&flags);
         status(&output, 1);
         let text = stdout(&output);
-        let stderr = text
-            .split("  stderr:\n")
-            .nth(1)
-            .unwrap()
-            .split("\n  to reproduce")
-            .next()
-            .unwrap();
+        let stderr = text.split("  stderr:\n").nth(1).unwrap();
         assert!(stderr.contains(&"x".repeat(5000)));
         assert_eq!(stderr.matches("detail\n").count(), 80);
         assert!(stderr.contains("last diagnostic"));
@@ -172,208 +166,8 @@ fn failed_program_shows_full_stderr_beyond_old_byte_and_line_limits() {
     }
 }
 
-fn reproduction(output: &Output) -> String {
-    stdout(output)
-        .split("  to reproduce (")
-        .nth(1)
-        .expect("failure should include reproduction commands")
-        .split_once("):\n")
-        .unwrap()
-        .1
-        .lines()
-        .take_while(|line| line.starts_with("    "))
-        .map(|line| line.strip_prefix("    ").unwrap())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[test]
-fn reproduction_preserves_arguments_input_and_compares_after_nonzero_exit() {
-    let suite = Suite::new("printf '<%s>\\n' \"$@\"\ncat\nprintf 'crash detail\\n' >&2\nexit 7");
-    let stem = "odd 'case";
-    let args = [
-        "two words",
-        "",
-        ";",
-        "$(touch injected)",
-        "*.txt",
-        "a'b",
-        "line\nnext\t\u{1b}",
-    ];
-    suite.write(&format!("{stem}.args"), shlex::try_join(args).unwrap());
-    suite.write(&format!("{stem}.in"), "from stdin\n");
-    suite.write(&format!("{stem}.out"), "expected\n");
-    suite.write(&format!("{stem}.err"), "expected error\n");
-    suite.write(&format!("{stem}.ret"), "0\n");
-    fs::rename(
-        suite.dir.path().join("program"),
-        suite.dir.path().join("prog 'name"),
-    )
-    .unwrap();
-    // Force the environment fallback so each shell can be tested in a sandbox.
-    suite.script("ps", "exit 1");
-    let mut paths = vec![suite.dir.path().to_path_buf()];
-    paths.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
-    let search_path = std::env::join_paths(paths).unwrap();
-    for shell in ["bash", "zsh", "fish", "sh"] {
-        match Command::new(shell).args(["-c", "true"]).output() {
-            Ok(_) => {}
-            Err(err)
-                if matches!(shell, "zsh" | "fish")
-                    && err.kind() == std::io::ErrorKind::NotFound =>
-            {
-                continue;
-            }
-            Err(err) => panic!("cannot start {shell}: {err}"),
-        }
-        for check_stderr in [false, true] {
-            let mut command = suite.command();
-            command
-                .env("PATH", &search_path)
-                .env("SHELL", format!("/bin/{shell}"));
-            command.args(["./prog 'name", "-t", stem, "--diff-tool", "builtin"]);
-            if check_stderr {
-                command.arg("-e");
-            }
-            let output = command.output().unwrap();
-            status(&output, 1);
-            let commands = reproduction(&output);
-            assert!(!commands.contains('\x1b'));
-            assert!(stdout(&output).contains(&format!(
-                "to reproduce ({}):",
-                if shell == "sh" { "sh; via bash" } else { shell }
-            )));
-            let mut replay_command = Command::new(shell);
-            if shell == "fish" {
-                replay_command.arg("--no-config");
-            }
-            let replay = replay_command
-                .args([if shell == "fish" { "-c" } else { "-ec" }, &commands])
-                .current_dir(suite.dir.path())
-                .output()
-                .unwrap();
-            assert!(
-                replay.status.success(),
-                "{shell}: {}",
-                String::from_utf8_lossy(&replay.stderr)
-            );
-            let text = stdout(&replay);
-            assert!(text.contains("exit status: 7"));
-            assert!(text.contains("+<two words>\n+<>\n+<;>\n+<$(touch injected)>\n+<*.txt>\n+<a'b>\n+<line\n+next\t\u{1b}>\n+from stdin"));
-            assert!(String::from_utf8_lossy(&replay.stderr).contains("crash detail"));
-            if check_stderr {
-                assert!(text.contains("expected exit status: 0"));
-                assert!(text.contains("-expected error\n+crash detail"));
-            }
-            assert!(!suite.dir.path().join("injected").exists());
-        }
-    }
-}
-
-#[test]
-fn shell_detection_prefers_active_ancestor_then_falls_back_to_shell_environment() {
-    let suite = Suite::new("exit 7");
-    suite.script(
-        "ps",
-        "if [ \"$2\" = 42 ]; then printf '1 /usr/local/bin/fish\\n'; else printf '42 cargo\\n'; fi",
-    );
-    let mut paths = vec![suite.dir.path().to_path_buf()];
-    paths.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
-    let search_path = std::env::join_paths(paths).unwrap();
-    let run = |shell: Option<&str>| {
-        let mut command = suite.command();
-        command
-            .env("PATH", &search_path)
-            .args(["suite", "./program", "--diff-tool", "builtin"]);
-        if let Some(shell) = shell {
-            command.env("SHELL", shell);
-        } else {
-            command.env_remove("SHELL");
-        }
-        let output = command.output().unwrap();
-        status(&output, 1);
-        stdout(&output)
-    };
-    assert!(run(Some("/bin/bash")).contains("to reproduce (fish):"));
-    suite.script("ps", "exit 1");
-    assert!(run(Some("/bin/zsh")).contains("to reproduce (zsh):"));
-    assert!(run(None).contains("to reproduce (sh; via bash):"));
-}
-
-#[test]
-fn reproduction_uses_eof_when_input_is_absent_and_falls_back_to_diff() {
-    let suite = Suite::new("cat\nprintf 'actual\\n'");
-    suite.script("ps", "exit 1");
-    let mut paths = vec![suite.dir.path().to_path_buf()];
-    paths.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
-    let search_path = std::env::join_paths(&paths).unwrap();
-    for shell in ["bash", "fish"] {
-        let Some(executable) = paths
-            .iter()
-            .map(|directory| directory.join(shell))
-            .find(|path| path.is_file())
-        else {
-            assert_eq!(shell, "fish", "bash is required for reproduction tests");
-            continue;
-        };
-        suite.script("delta", "printf 'delta replay\\n'\nexit 1");
-        let output = diff_command(&suite)
-            .env("SHELL", format!("/bin/{shell}"))
-            .args(["--color", "never"])
-            .output()
-            .unwrap();
-        let commands = reproduction(&output);
-        assert!(commands.contains("< /dev/null"));
-        let flag = if shell == "fish" { "-c" } else { "-ec" };
-        let mut replay_command = Command::new(&executable);
-        if shell == "fish" {
-            replay_command.arg("--no-config");
-        }
-        let replay = replay_command
-            .args([flag, &commands])
-            .env("PATH", &search_path)
-            .current_dir(suite.dir.path())
-            .output()
-            .unwrap();
-        assert!(
-            replay.status.success(),
-            "{}",
-            String::from_utf8_lossy(&replay.stderr)
-        );
-        assert!(
-            stdout(&replay).contains("delta replay"),
-            "{shell}: {}\n{}",
-            stdout(&replay),
-            String::from_utf8_lossy(&replay.stderr)
-        );
-        fs::remove_file(suite.dir.path().join("delta")).unwrap();
-        let mut replay_command = Command::new(&executable);
-        if shell == "fish" {
-            replay_command.arg("--no-config");
-        }
-        let replay = replay_command
-            .args([flag, &commands])
-            .env("PATH", "/usr/bin:/bin")
-            .current_dir(suite.dir.path())
-            .output()
-            .unwrap();
-        assert!(
-            replay.status.success(),
-            "{}",
-            String::from_utf8_lossy(&replay.stderr)
-        );
-        assert!(stdout(&replay).contains("-hello\n+actual"));
-    }
-}
-
-#[test]
-fn failure_colors_cover_names_diagnostics_commands_and_summary() {
+fn failure_colors_cover_names_diagnostics_and_summary() {
     let suite = Suite::new("printf 'detail\\n' >&2\nexit 7");
     let output = suite.run(&["--color", "always", "--diff-tool", "builtin"]);
     status(&output, 1);
@@ -383,16 +177,10 @@ fn failure_colors_cover_names_diagnostics_commands_and_summary() {
         "\x1b[1;35m---- one ----",
         "\x1b[31mprogram exited with 7",
         "\x1b[33m  detail",
-        "\x1b[1;36mto reproduce",
         "\x1b[1;31m1 failed",
     ] {
         assert!(text.contains(colored), "missing {colored:?}");
     }
-    assert!(
-        ["\x1b[32mcapture=", "\x1b[32mbegin", "\x1b[32mbash -c"]
-            .iter()
-            .any(|prefix| text.contains(prefix))
-    );
     assert!(!stdout(&suite.run(&["--color", "never", "--diff-tool", "builtin"])).contains('\x1b'));
 }
 

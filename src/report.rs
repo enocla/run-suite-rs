@@ -1,13 +1,11 @@
 use crate::{
-    cli::{Cli, ColorMode},
+    cli::ColorMode,
     diff::DiffTool,
     runner::{Problem, TestResult},
-    shell::Shell,
 };
 use std::{
     env,
     io::{self, IsTerminal, Write},
-    path::Path,
     time::Duration,
 };
 
@@ -16,7 +14,6 @@ pub struct Reporter {
     pub quiet: bool,
     pub nocapture: bool,
     diff_tool: DiffTool,
-    shell: Shell,
 }
 
 impl Reporter {
@@ -35,7 +32,6 @@ impl Reporter {
             quiet,
             nocapture,
             diff_tool,
-            shell: Shell::detect(),
         }
     }
 
@@ -84,7 +80,7 @@ impl Reporter {
         }
     }
 
-    pub fn failures(&self, results: &[TestResult], program: &Path, cli: &Cli) {
+    pub fn failures(&self, results: &[TestResult]) {
         if self.quiet {
             println!();
         }
@@ -99,7 +95,7 @@ impl Reporter {
             }
             println!("\n{}", self.style(title, code));
             for result in &group {
-                self.diagnostics(result, program, cli);
+                self.diagnostics(result);
             }
         }
         for (timed_out, title, code) in [(false, "failures:", "1;31"), (true, "timeouts:", "1;33")]
@@ -124,7 +120,7 @@ impl Reporter {
         }
     }
 
-    fn diagnostics(&self, result: &TestResult, program: &Path, cli: &Cli) {
+    fn diagnostics(&self, result: &TestResult) {
         println!(
             "\n{}",
             self.style(
@@ -192,149 +188,6 @@ impl Reporter {
         }
         if !result.stderr.is_empty() {
             self.block("stderr", &result.stderr, " ", "33");
-        }
-        self.reproduce(result, program, cli);
-    }
-
-    fn reproduce(&self, result: &TestResult, program: &Path, cli: &Cli) {
-        return;
-        println!(
-            "\n  {}",
-            self.style(&format!("to reproduce ({}):", self.shell.label()), "1;36")
-        );
-
-        if !result.fixture_loaded {
-            // Invalid fixtures cannot supply a faithful direct program invocation.
-            let runner = env::current_exe().unwrap_or_else(|_| "runSuite".into());
-            let mut command = match &cli.suite {
-                Some(suite) => format!(
-                    "{} {} {} --filter {} --exact",
-                    self.shell.path(&runner),
-                    self.shell.path(suite),
-                    self.shell.path(program),
-                    self.shell.quote(&result.name)
-                ),
-                None => format!(
-                    "{} {} --test {}",
-                    self.shell.path(&runner),
-                    self.shell.path(program),
-                    self.shell.quote(&result.name)
-                ),
-            };
-            if cli.check_stderr {
-                command.push_str(" -e");
-            }
-            if cli.valgrind {
-                command.push_str(" -v");
-            }
-            for line in self.shell.wrap(vec![command]) {
-                println!("    {}", self.style(&line, "32"));
-            }
-            return;
-        }
-        let mut command = self.shell.path(program);
-        for arg in &result.args {
-            command.push(' ');
-            command.push_str(&self.shell.quote(arg));
-        }
-        if cli.valgrind {
-            // Keep Valgrind diagnostics separate from the target's stderr.
-            command = format!(
-                "valgrind --log-file=\"$capture/valgrind.log\" --tool=memcheck --leak-check=full --show-leak-kinds=all {command}"
-            );
-        }
-        let input = if result.has_input {
-            fixture_path(self.shell, cli, &result.name, "in")
-        } else {
-            "/dev/null".into()
-        };
-        let fish = self.shell == Shell::Fish;
-        let mut lines = if fish {
-            vec![
-                "begin".into(),
-                "  set -l capture (mktemp -d)".into(),
-                "  if test -n \"$capture\"".into(),
-                "  set -l program_status 0".into(),
-                format!(
-                    "  {command} < {input} > \"$capture/stdout\" 2> \"$capture/stderr\"; or set program_status $status"
-                ),
-                "  cat -- \"$capture/stderr\" >&2".into(),
-                "  printf 'exit status: %s\\n' \"$program_status\"".into(),
-            ]
-        } else {
-            vec![
-            "capture=$(mktemp -d) && (".to_owned(),
-            "  trap 'rm -f -- \"$capture/stdout\" \"$capture/stderr\" \"$capture/valgrind.log\"; rmdir -- \"$capture\"' 0".into(),
-            "  program_status=0".into(),
-            format!("  {command} < {input} > \"$capture/stdout\" 2> \"$capture/stderr\" || program_status=$?"),
-            "  cat -- \"$capture/stderr\" >&2".into(),
-            "  printf 'exit status: %s\\n' \"$program_status\"".into(),
-        ]
-        };
-        if cli.valgrind {
-            lines.push("  cat -- \"$capture/valgrind.log\"".into());
-        }
-        if cli.check_stderr {
-            lines.push(format!(
-                "  printf 'expected exit status: '; cat -- {}",
-                fixture_path(self.shell, cli, &result.name, "ret")
-            ));
-        }
-        for (stream, extension) in [("stdout", "out"), ("stderr", "err")] {
-            if stream == "stderr" && !cli.check_stderr {
-                continue;
-            }
-            let files = format!(
-                "-- {} \"$capture/{stream}\"",
-                fixture_path(self.shell, cli, &result.name, extension)
-            );
-            let diff = match &self.diff_tool {
-                DiffTool::Auto if fish => format!(
-                    "if command -sq delta; delta --paging=never {files}; else; diff -u {files}; end"
-                ),
-                DiffTool::Auto => format!(
-                    "if command -v delta >/dev/null 2>&1; then delta --paging=never {files}; else diff -u {files}; fi"
-                ),
-                DiffTool::Builtin => format!("diff -u {files}"),
-                DiffTool::Command(words) => {
-                    let mut command = words
-                        .iter()
-                        .map(|word| self.shell.quote(word))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if words.len() == 1 {
-                        match words[0].as_str() {
-                            "delta" => command.push_str(" --paging=never"),
-                            "git" => command.push_str(
-                                " --no-pager diff --no-index --no-ext-diff --no-textconv",
-                            ),
-                            "diff" => command.push_str(" -u"),
-                            _ => {}
-                        }
-                    }
-                    format!("{command} {files}")
-                }
-            };
-            // A diff normally exits with 1; still run later comparisons and cleanup.
-            lines.push(if fish {
-                format!("  begin; {diff}; end; or true")
-            } else {
-                format!("  {{ {diff}; }} || :")
-            });
-        }
-        if fish {
-            lines.push(
-                "  rm -f -- \"$capture/stdout\" \"$capture/stderr\" \"$capture/valgrind.log\""
-                    .into(),
-            );
-            lines.push("  rmdir -- \"$capture\"".into());
-            lines.push("  end".into());
-            lines.push("end".into());
-        } else {
-            lines.push(")".into());
-        }
-        for line in self.shell.wrap(lines) {
-            println!("    {}", self.style(&line, "32"));
         }
     }
 
@@ -420,15 +273,6 @@ pub(crate) fn format_duration(duration: Duration) -> String {
     } else {
         format!("{:.3}s", duration.as_secs_f64())
     }
-}
-
-fn fixture_path(shell: Shell, cli: &Cli, stem: &str, extension: &str) -> String {
-    let path = cli.fixture_path(stem, extension);
-    shell.path(&if path.is_absolute() {
-        path
-    } else {
-        Path::new(".").join(path)
-    })
 }
 
 fn has_mismatch(result: &TestResult, stream: &str) -> bool {

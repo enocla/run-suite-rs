@@ -3,7 +3,6 @@ mod cli;
 mod diff;
 mod report;
 mod runner;
-mod shell;
 #[cfg(unix)]
 mod watchdog;
 
@@ -57,7 +56,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     reporter.start(selected.len());
     let start = Instant::now();
     let results = runner::run_tests(&selected, &program, cli, |result| reporter.result(result));
-    reporter.failures(&results, &program, cli);
+    reporter.failures(&results);
     reporter.summary(
         &results,
         filtered,

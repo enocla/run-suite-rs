@@ -21,8 +21,6 @@ pub struct TestResult {
     pub args: Vec<String>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    pub has_input: bool,
-    pub fixture_loaded: bool,
 }
 
 pub enum Problem {
@@ -235,8 +233,6 @@ fn run_test(stem: &str, program: &Path, cli: &Cli) -> TestResult {
         args: Vec::new(),
         stdout: Vec::new(),
         stderr: Vec::new(),
-        has_input: false,
-        fixture_loaded: false,
     };
     if let Err(err) = execute(stem, program, cli, &mut result) {
         result.problems.push(Problem::Message(err));
@@ -248,8 +244,6 @@ fn run_test(stem: &str, program: &Path, cli: &Cli) -> TestResult {
 fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Result<(), String> {
     let fixture = Fixture::load(stem, cli)?;
     result.args.clone_from(&fixture.args);
-    result.has_input = fixture.input.is_some();
-    result.fixture_loaded = true;
     let temporary =
         tempfile::tempdir().map_err(|err| format!("cannot create temporary directory: {err}"))?;
     let memory_path = temporary.path().join("valgrind.log");

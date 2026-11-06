@@ -128,24 +128,6 @@ test shows its captured stderr, including when stderr also has a diff. Output-li
 failures retain only the first `--max-output-bytes` bytes per stream and identify
 which stream was truncated.
 
-Each failure also prints a copyable **to reproduce** command block for the
-detected shell. The runner checks its parent processes for the active shell,
-then falls back to `$SHELL` when process inspection is unavailable. Bash, zsh,
-and fish get native commands and quoting. For POSIX shells or an unknown shell,
-the block explicitly invokes `bash -c` and requires bash on `PATH`.
-Run it from the same working directory. It invokes the resolved program with
-the parsed, shell-quoted `.args` values, redirects `.in` (or `/dev/null` when
-absent), prints stderr and the exit status, and compares captured stdout against
-`.out`. Arguments are passed as arguments, rather than redirecting the `.args`
-file into stdin. A nonzero program exit still runs the comparisons. With `-e`,
-the command also compares stderr with `.err` and shows the expected `.ret`;
-with `-v`, it runs Valgrind and prints its separate log. Reproduction uses
-temporary files and removes them afterward. The auto comparison uses delta
-when available and otherwise `diff -u`; explicit diff commands are preserved,
-and `builtin` uses `diff -u`. Invalid fixtures instead get a command to rerun
-that test through `runSuite`. Reproduction commands do not impose `--timeout`,
-so a timed-out program can be investigated interactively.
-
 ## Failure diffs
 
 Mismatches automatically use `delta` when it is available on `PATH`, with paging
