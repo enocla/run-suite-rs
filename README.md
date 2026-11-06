@@ -53,7 +53,7 @@ stdout differs at byte 0 (expected 4 bytes, actual 4 bytes)
 failures:
     test2
 
-test result: FAILED. 2 passed; 1 failed; 0 filtered out; 0 skipped; finished in 7ms
+test result: FAILED. 2 passed; 1 failed; 0 timed out; 0 filtered out; 0 skipped; finished in 7ms
 ```
 
 ## Suite format
@@ -101,21 +101,23 @@ An executable can be an explicit path, a bare local name, or a command on `PATH`
 | `--filter NAME --exact` | Match each supplied filter against the entire stem. |
 | `--list` | List selected tests without validating or running the executable. |
 | `-j N`, `--jobs N` | Run at most N tests in parallel (default: 50); use 1 for sequential execution. |
-| `--fail-fast` | Report through the first failure in suite order; count later selected tests as skipped. |
+| `--fail-fast` | Report through the first failure or timeout in suite order; count later selected tests as skipped. |
 | `--nocapture` | Also show captured stdout/stderr for passing tests. |
-| `-q`, `--quiet` | Use progress dots and `F` marks, retaining failure details and summaries. |
+| `-q`, `--quiet` | Use progress dots, `F` for failures, and `T` for timeouts, retaining details and summaries. |
 | `--timeout SECONDS` | Per-test limit, supporting fractional seconds; default: 0.5 seconds (500 ms), including Valgrind. |
 | `--max-output-bytes BYTES` | Maximum captured bytes per stream; default: 1048576 (1 MiB). Exceeding the limit fails the test. |
 | `--color auto\|always\|never` | Auto colors terminal output unless `NO_COLOR` is set or `TERM=dumb`. |
 | `--diff-tool COMMAND` | Failure renderer; `auto` (default) tries delta, Git, then system diff. Use `builtin` or a quoted command to override. |
 
 Tests run in parallel with up to 50 concurrent tests by default, including
-repeated stems. Results and failure details are always reported in suite order.
+repeated stems. Results are reported in suite order; details retain suite order
+within the failures and timeouts sections.
 Use `--jobs 1` for tests that share files or otherwise need sequential execution.
-With `--fail-fast`, any completed failure stops new tests from being scheduled.
-Earlier tests finish so the reported failure is the first in suite order, even
-if a later test failed sooner. Already running tests finish; results after the
-first failure in suite order are omitted and counted as skipped.
+With `--fail-fast`, any completed failure or timeout stops new tests from being
+scheduled. Earlier tests finish so the reported failure or timeout is the first
+in suite order, even if a later test finished sooner. Already running tests
+finish; results after the first failure or timeout in suite order are omitted
+and counted as skipped.
 Passing output is hidden by default. Failure reports escape terminal control
 characters and invalid UTF-8. Within the output limit, comparison uses the
 complete, original bytes. Built-in output blocks show the full output and mark
@@ -202,7 +204,12 @@ limit with `--max-output-bytes BYTES` when larger output is expected. A test tha
 exceeds a capture limit fails and retains the captured prefix for diagnosis.
 
 Tests time out after 500 ms by default, including time spent in Valgrind. Use
-`--timeout SECONDS` to allow a longer run. Timed-out tests retain partial output.
+`--timeout SECONDS` to allow a longer run. Timeouts appear as yellow `TIMEOUT`
+results (`T` in quiet mode), with a separate `timeouts:` list and `timed out`
+summary count. They are excluded from the `failed` count but still cause exit
+status 1 and trigger `--fail-fast`. If only timeouts prevent success, the overall
+result is yellow `TIMEOUT`; other failures make it red `FAILED`. Timed-out tests
+retain partial output.
 On Unix, each test has a separate watchdog process that kills its process group
 on timeout, output overflow, normal program exit, or runner termination, including
 `SIGKILL`. The watchdog also removes temporary capture resources if the runner

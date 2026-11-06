@@ -51,7 +51,7 @@ pub struct Cli {
     #[arg(short = 'j', long, value_name = "N", default_value = "50")]
     pub jobs: NonZeroUsize,
 
-    /// Stop reporting at the first failed test in suite order
+    /// Stop reporting at the first failed or timed-out test in suite order
     #[arg(long)]
     #[arg(short = 'f')]
     pub fail_fast: bool,
@@ -60,7 +60,7 @@ pub struct Cli {
     #[arg(long)]
     pub nocapture: bool,
 
-    /// Print progress dots instead of individual result lines
+    /// Print progress dots, F for failures, and T for timeouts
     #[arg(short, long)]
     pub quiet: bool,
 

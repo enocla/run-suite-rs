@@ -58,16 +58,15 @@ impl Reporter {
     }
 
     pub fn result(&self, result: &TestResult) {
-        let (word, code) = if result.passed() {
-            ("ok", "32")
+        let (word, mark, code) = if result.timed_out() {
+            ("TIMEOUT", "T", "1;33")
+        } else if result.passed() {
+            ("ok", ".", "32")
         } else {
-            ("FAILED", "31;1")
+            ("FAILED", "F", "31;1")
         };
         if self.quiet {
-            print!(
-                "{}",
-                self.style(if result.passed() { "." } else { "F" }, code)
-            );
+            print!("{}", self.style(mark, code));
         } else {
             println!(
                 "test {} ... {} {}",
@@ -89,76 +88,112 @@ impl Reporter {
         if self.quiet {
             println!();
         }
-        if results.iter().all(TestResult::passed) {
-            return;
-        }
-        println!("\n{}", self.style("failures:", "31;1"));
-        for result in results.iter().filter(|result| !result.passed()) {
-            println!(
-                "\n{}",
-                self.style(&format!("---- {} ----", safe_text(&result.name)), "1;35")
-            );
-            if !result.args.is_empty() {
-                println!("{} {:?}", self.style("arguments:", "1;36"), result.args);
+        for (timed_out, title, code) in [(false, "failures:", "1;31"), (true, "timeouts:", "1;33")]
+        {
+            let group: Vec<_> = results
+                .iter()
+                .filter(|result| !result.passed() && result.timed_out() == timed_out)
+                .collect();
+            if group.is_empty() {
+                continue;
             }
-            for problem in &result.problems {
-                match problem {
-                    Problem::Message(message) => {
-                        println!("{}", self.style(&safe_text(message), "31"))
-                    }
-                    Problem::Mismatch {
-                        stream,
-                        expected,
-                        actual,
-                    } => {
-                        let offset = expected
-                            .iter()
-                            .zip(actual)
-                            .position(|(a, b)| a != b)
-                            .unwrap_or(expected.len().min(actual.len()));
-                        println!("{}", self.style(&format!(
+            println!("\n{}", self.style(title, code));
+            for result in &group {
+                self.diagnostics(result, program, cli);
+            }
+        }
+        for (timed_out, title, code) in [(false, "failures:", "1;31"), (true, "timeouts:", "1;33")]
+        {
+            let group: Vec<_> = results
+                .iter()
+                .filter(|result| !result.passed() && result.timed_out() == timed_out)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            println!("\n{}", self.style(title, code));
+            for result in group {
+                println!(
+                    "    {}",
+                    self.style(
+                        &safe_text(&result.name),
+                        if timed_out { code } else { "1;35" }
+                    )
+                );
+            }
+        }
+    }
+
+    fn diagnostics(&self, result: &TestResult, program: &Path, cli: &Cli) {
+        println!(
+            "\n{}",
+            self.style(
+                &format!("---- {} ----", safe_text(&result.name)),
+                if result.timed_out() { "1;33" } else { "1;35" }
+            )
+        );
+        if !result.args.is_empty() {
+            println!("{} {:?}", self.style("arguments:", "1;36"), result.args);
+        }
+        for problem in &result.problems {
+            match problem {
+                Problem::Message(message) => {
+                    println!("{}", self.style(&safe_text(message), "31"))
+                }
+                Problem::Timeout(duration) => println!(
+                    "{}",
+                    self.style(
+                        &format!("timed out after {}", format_duration(*duration)),
+                        "1;33"
+                    )
+                ),
+                Problem::Mismatch {
+                    stream,
+                    expected,
+                    actual,
+                } => {
+                    let offset = expected
+                        .iter()
+                        .zip(actual)
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(expected.len().min(actual.len()));
+                    println!("{}", self.style(&format!(
                             "{stream} differs at byte {offset} (expected {} bytes, actual {} bytes)",
                             expected.len(),
                             actual.len()
                         ), "1;33"));
-                        let shown = match self.diff_tool.show(stream, expected, actual, self.color)
-                        {
-                            Ok(shown) => shown,
-                            Err(err) => {
-                                println!(
-                                    "{}",
-                                    self.style(
-                                        &format!(
-                                            "diff unavailable: {}; using built-in report",
-                                            safe_text(&err)
-                                        ),
-                                        "33"
-                                    )
-                                );
-                                false
-                            }
-                        };
-                        if !shown {
-                            self.block("expected", expected, "-", "31");
-                            self.block("actual", actual, "+", "32");
+                    let shown = match self.diff_tool.show(stream, expected, actual, self.color) {
+                        Ok(shown) => shown,
+                        Err(err) => {
+                            println!(
+                                "{}",
+                                self.style(
+                                    &format!(
+                                        "diff unavailable: {}; using built-in report",
+                                        safe_text(&err)
+                                    ),
+                                    "33"
+                                )
+                            );
+                            false
                         }
+                    };
+                    if !shown {
+                        self.block("expected", expected, "-", "31");
+                        self.block("actual", actual, "+", "32");
                     }
-                    Problem::Valgrind(log) => self.block("Valgrind log", log, " ", "33"),
                 }
+                Problem::Valgrind(log) => self.block("Valgrind log", log, " ", "33"),
             }
-            // Always show complete stderr, even if an external diff hides context.
-            if !result.stdout.is_empty() && !has_mismatch(result, "stdout") {
-                self.block("stdout", &result.stdout, " ", "36");
-            }
-            if !result.stderr.is_empty() {
-                self.block("stderr", &result.stderr, " ", "33");
-            }
-            self.reproduce(result, program, cli);
         }
-        println!("\n{}", self.style("failures:", "1;31"));
-        for result in results.iter().filter(|result| !result.passed()) {
-            println!("    {}", self.style(&safe_text(&result.name), "1;35"));
+        // Always show complete stderr, even if an external diff hides context.
+        if !result.stdout.is_empty() && !has_mismatch(result, "stdout") {
+            self.block("stdout", &result.stdout, " ", "36");
         }
+        if !result.stderr.is_empty() {
+            self.block("stderr", &result.stderr, " ", "33");
+        }
+        self.reproduce(result, program, cli);
     }
 
     fn reproduce(&self, result: &TestResult, program: &Path, cli: &Cli) {
@@ -350,20 +385,27 @@ impl Reporter {
         elapsed: Duration,
     ) {
         let passed = results.iter().filter(|result| result.passed()).count();
-        let failed = results.len() - passed;
-        let (label, code) = if failed == 0 {
-            ("ok", "32;1")
-        } else {
+        let timed_out = results.iter().filter(|result| result.timed_out()).count();
+        let failed = results.len() - passed - timed_out;
+        let (label, code) = if failed > 0 {
             ("FAILED", "31;1")
+        } else if timed_out > 0 {
+            ("TIMEOUT", "1;33")
+        } else {
+            ("ok", "32;1")
         };
         println!(
-            "\n{} {}. {}; {}; {}; {}; {}\n",
+            "\n{} {}. {}; {}; {}; {}; {}; {}\n",
             self.style("test result:", "1;34"),
             self.style(label, code),
             self.style(&format!("{passed} passed"), "32"),
             self.style(
                 &format!("{failed} failed"),
                 if failed == 0 { "2" } else { "1;31" }
+            ),
+            self.style(
+                &format!("{timed_out} timed out"),
+                if timed_out == 0 { "2" } else { "1;33" }
             ),
             self.style(&format!("{filtered} filtered out"), "33"),
             self.style(&format!("{skipped} skipped"), "35"),

@@ -27,6 +27,7 @@ pub struct TestResult {
 
 pub enum Problem {
     Message(String),
+    Timeout(Duration),
     Mismatch {
         stream: &'static str,
         expected: Vec<u8>,
@@ -38,6 +39,12 @@ pub enum Problem {
 impl TestResult {
     pub fn passed(&self) -> bool {
         self.problems.is_empty()
+    }
+
+    pub fn timed_out(&self) -> bool {
+        self.problems
+            .iter()
+            .any(|problem| matches!(problem, Problem::Timeout(_)))
     }
 }
 
@@ -365,10 +372,7 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
         }
     }
     if timed_out {
-        result.problems.push(Problem::Message(format!(
-            "timed out after {}",
-            crate::report::format_duration(cli.timeout)
-        )));
+        result.problems.push(Problem::Timeout(cli.timeout));
     } else if !limited {
         compare(
             "stdout",

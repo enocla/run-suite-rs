@@ -73,7 +73,7 @@ fn passes_with_named_result_timing_and_summary() {
     status(&output, 0);
     let text = stdout(&output);
     assert!(text.contains("running 1 test\ntest one ... ok ("));
-    assert!(text.contains("1 passed; 0 failed; 0 filtered out; 0 skipped"));
+    assert!(text.contains("1 passed; 0 failed; 0 timed out; 0 filtered out; 0 skipped"));
     assert!(text.contains("finished in"));
     assert!(!text.contains('\x1b'));
 }
@@ -460,10 +460,10 @@ fn filters_list_and_exact_selection_report_correct_counts() {
     suite.write("one.more.out", "hello\n");
     let output = suite.run(&["--filter", "one"]);
     status(&output, 0);
-    assert!(stdout(&output).contains("2 passed; 0 failed; 1 filtered out"));
+    assert!(stdout(&output).contains("2 passed; 0 failed; 0 timed out; 1 filtered out"));
     let output = suite.run(&["--filter", "one", "--exact"]);
     status(&output, 0);
-    assert!(stdout(&output).contains("1 passed; 0 failed; 2 filtered out"));
+    assert!(stdout(&output).contains("1 passed; 0 failed; 0 timed out; 2 filtered out"));
     // Listing is independent of the executable and fixture availability.
     let output = suite
         .command()
@@ -486,7 +486,7 @@ fn direct_test_runs_without_a_suite_file() {
         let output = suite.command().args(args).output().unwrap();
         status(&output, 0);
         assert!(stdout(&output).contains("test one ... ok"));
-        assert!(stdout(&output).contains("1 passed; 0 failed; 0 filtered out"));
+        assert!(stdout(&output).contains("1 passed; 0 failed; 0 timed out; 0 filtered out"));
     }
 }
 
@@ -511,7 +511,7 @@ fn direct_tests_run_only_supplied_stems_in_order() {
     assert!(names[0].starts_with("test two ... ok"));
     assert!(names[1].starts_with("test one ... ok"));
     assert!(names[2].starts_with("test two ... ok"));
-    assert!(text.contains("3 passed; 0 failed; 0 filtered out"));
+    assert!(text.contains("3 passed; 0 failed; 0 timed out; 0 filtered out"));
     assert!(!text.contains("unselected"));
 }
 
@@ -590,14 +590,14 @@ fn repeated_filters_select_a_union_without_extra_runs() {
     let output = suite.run(&["--filter", "two", "--filter", "one", "--filter", "one.more"]);
     status(&output, 0);
     let text = stdout(&output);
-    assert!(text.contains("3 passed; 0 failed; 1 filtered out"));
+    assert!(text.contains("3 passed; 0 failed; 0 timed out; 1 filtered out"));
     assert!(text.find("test one ...").unwrap() < text.find("test two ...").unwrap());
     let output = suite.run(&["--filter", "two", "--filter", "one", "--exact"]);
     status(&output, 0);
-    assert!(stdout(&output).contains("2 passed; 0 failed; 2 filtered out"));
+    assert!(stdout(&output).contains("2 passed; 0 failed; 0 timed out; 2 filtered out"));
     let output = suite.run(&["--filter", "absent", "--filter", "also.absent"]);
     status(&output, 0);
-    assert!(stdout(&output).contains("0 passed; 0 failed; 4 filtered out"));
+    assert!(stdout(&output).contains("0 passed; 0 failed; 0 timed out; 4 filtered out"));
 }
 
 #[test]
@@ -606,7 +606,7 @@ fn fail_fast_counts_unrun_tests_as_skipped() {
     suite.write("suite", "one two three\n");
     let output = suite.run(&["--fail-fast"]);
     status(&output, 1);
-    assert!(stdout(&output).contains("0 passed; 1 failed; 0 filtered out; 2 skipped"));
+    assert!(stdout(&output).contains("0 passed; 1 failed; 0 timed out; 0 filtered out; 2 skipped"));
     assert!(!stdout(&output).contains("test two ..."));
 }
 
@@ -719,11 +719,11 @@ esac
         if first_fails {
             assert!(text.contains("test one ... FAILED"));
             assert!(!text.contains("test two ..."));
-            assert!(text.contains("0 passed; 1 failed; 0 filtered out; 3 skipped"));
+            assert!(text.contains("0 passed; 1 failed; 0 timed out; 0 filtered out; 3 skipped"));
         } else {
             assert!(text.contains("test one ... ok"));
             assert!(text.contains("test two ... FAILED"));
-            assert!(text.contains("1 passed; 1 failed; 0 filtered out; 2 skipped"));
+            assert!(text.contains("1 passed; 1 failed; 0 timed out; 0 filtered out; 2 skipped"));
         }
         assert!(!text.contains("test three ..."));
         assert!(!text.contains("test four ..."));
@@ -755,9 +755,116 @@ fn timeout_kills_the_process_group_and_preserves_partial_output() {
     status(&output, 1);
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(stdout(&output).contains("timed out after 250ms"));
+    assert!(stdout(&output).contains("test one ... TIMEOUT"));
+    assert!(stdout(&output).contains("timeouts:\n    one"));
+    assert!(stdout(&output).contains("test result: TIMEOUT. 0 passed; 0 failed; 1 timed out"));
+    assert!(!stdout(&output).contains("failures:"));
+    assert!(!stdout(&output).contains('\x1b'));
     assert!(stdout(&output).contains("partial"));
     std::thread::sleep(Duration::from_millis(900));
     assert!(!suite.dir.path().join("survived").exists());
+}
+
+#[test]
+fn mixed_results_report_timeouts_separately_in_normal_and_quiet_modes() {
+    let suite = Suite::new(
+        r#"
+case "$1" in
+    slow) printf 'partial\n'; sleep 10 ;;
+    bad) printf 'wrong\n' ;;
+    *) printf 'hello\n' ;;
+esac
+"#,
+    );
+    suite.write("suite", "one bad slow\n");
+    for stem in ["bad", "slow"] {
+        suite.write(&format!("{stem}.args"), stem);
+        suite.write(&format!("{stem}.out"), "hello\n");
+    }
+    for quiet in [false, true] {
+        let mut flags = vec!["-j", "1", "--timeout", "0.25", "--diff-tool", "builtin"];
+        if quiet {
+            flags.push("-q");
+        }
+        let output = suite.run(&flags);
+        status(&output, 1);
+        let text = stdout(&output);
+        if quiet {
+            assert!(text.contains("running 3 tests\n.FT\n"));
+        } else {
+            assert!(text.contains("test one ... ok"));
+            assert!(text.contains("test bad ... FAILED"));
+            assert!(text.contains("test slow ... TIMEOUT"));
+        }
+        assert!(text.contains("failures:\n    bad\n\ntimeouts:\n    slow\n"));
+        assert!(text.contains("test result: FAILED. 1 passed; 1 failed; 1 timed out"));
+        assert!(text.contains("partial"));
+        assert!(!text.contains('\x1b'));
+    }
+}
+
+#[test]
+fn timeout_colors_and_fail_fast_remain_distinct_from_failures() {
+    let suite = Suite::new("printf 'partial\\n'\nsleep 10");
+    suite.write("suite", "one two\n");
+    suite.write("two.out", "hello\n");
+    for quiet in [false, true] {
+        let mut flags = vec![
+            "-j",
+            "1",
+            "--timeout",
+            "0.25",
+            "--fail-fast",
+            "--color",
+            "always",
+        ];
+        if quiet {
+            flags.push("-q");
+        }
+        let output = suite.run(&flags);
+        status(&output, 1);
+        let text = stdout(&output);
+        for colored in [
+            "\x1b[1;33mTIMEOUT\x1b[0m",
+            "\x1b[1;33mtimeouts:\x1b[0m",
+            "\x1b[1;33m---- one ----\x1b[0m",
+            "\x1b[1;33mtimed out after 250ms\x1b[0m",
+            "\x1b[1;33mone\x1b[0m",
+            "\x1b[1;33m1 timed out\x1b[0m",
+        ] {
+            assert!(text.contains(colored), "missing {colored:?}");
+        }
+        if quiet {
+            assert!(text.contains("\x1b[1;33mT\x1b[0m\n"));
+        }
+        assert!(text.contains("0 passed"));
+        assert!(text.contains("0 failed"));
+        assert!(text.contains("1 skipped"));
+        assert!(!text.contains("FAILED"));
+        assert!(!text.contains("failures:"));
+        assert!(!text.contains("two"));
+    }
+}
+
+#[test]
+fn valgrind_timeout_keeps_its_log_without_becoming_a_memory_failure() {
+    let suite = Suite::new("printf 'partial\\n'\nsleep 10");
+    suite.write("one.err", "");
+    suite.write("one.ret", "0\n");
+    mock_valgrind(&suite, "==42== Memcheck startup");
+    let output = valgrind_command(&suite)
+        .args(["--timeout", "0.25"])
+        .output()
+        .unwrap();
+    status(&output, 1);
+    let text = stdout(&output);
+    assert!(text.contains("test one ... TIMEOUT"));
+    assert!(text.contains("0 passed; 0 failed; 1 timed out"));
+    assert!(text.contains("Valgrind log:"));
+    assert!(text.contains("==42== Memcheck startup"));
+    assert!(text.contains("partial"));
+    assert!(!text.contains("did not produce an error summary"));
+    assert!(!text.contains("failures:"));
 }
 
 #[test]
@@ -990,7 +1097,7 @@ fn relative_suite_path_resolves_all_companion_files_and_preserves_test_names() {
         .unwrap();
     status(&output, 0);
     assert!(stdout(&output).contains("test nested/one.case ... ok"));
-    assert!(stdout(&output).contains("1 passed; 0 failed; 1 filtered out"));
+    assert!(stdout(&output).contains("1 passed; 0 failed; 0 timed out; 1 filtered out"));
     let listed = suite
         .command()
         .args(["suite files/suite", "absent", "--list"])
@@ -1191,7 +1298,8 @@ fn endless_stdout_and_stderr_fail_promptly_with_bounded_capture() {
         status(&output, 1);
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(stdout(&output).contains("exceeded output limit of 4096 bytes"));
-        assert!(!stdout(&output).contains("timed out"));
+        assert!(!stdout(&output).contains("timed out after"));
+        assert!(stdout(&output).contains("0 timed out"));
         assert!(output.stdout.len() < 6000);
         assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
         std::thread::sleep(Duration::from_millis(900));
