@@ -42,8 +42,9 @@ impl DiffTool {
         expected: &[u8],
         actual: &[u8],
         color: bool,
+        inline: bool,
     ) -> Result<bool, String> {
-        if matches!(self, Self::Builtin) {
+        if matches!(self, Self::Builtin) || (inline && !color && matches!(self, Self::Auto)) {
             return Ok(false);
         }
         let expected = display_text(expected);
@@ -61,13 +62,21 @@ impl DiffTool {
         match self {
             Self::Auto => {
                 // Missing tools are normal; a tool that starts but fails gets a fallback report.
-                let tools: &[&str] = if color {
+                let tools: &[&str] = if inline {
+                    &["delta"]
+                } else if color {
                     &["delta", "git", "diff"]
                 } else {
                     &["git", "diff"]
                 };
                 for &name in tools {
-                    match run_tool(&[name.to_owned()], &expected_path, &actual_path, color) {
+                    match run_tool(
+                        &[name.to_owned()],
+                        &expected_path,
+                        &actual_path,
+                        color,
+                        inline,
+                    ) {
                         Ok(()) => return Ok(true),
                         Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                         Err(err) => return Err(format!("{name}: {err}")),
@@ -76,7 +85,7 @@ impl DiffTool {
                 Ok(false)
             }
             Self::Command(words) => {
-                run_tool(words, &expected_path, &actual_path, color)
+                run_tool(words, &expected_path, &actual_path, color, inline)
                     .map_err(|err| format!("{}: {err}", words[0]))?;
                 Ok(true)
             }
@@ -101,7 +110,13 @@ fn display_text(bytes: &[u8]) -> String {
     text
 }
 
-fn run_tool(words: &[String], expected: &Path, actual: &Path, color: bool) -> io::Result<()> {
+fn run_tool(
+    words: &[String],
+    expected: &Path,
+    actual: &Path,
+    color: bool,
+    inline: bool,
+) -> io::Result<()> {
     // Delta can retain ANSI from its internally generated diff even with --raw.
     // Use plain Git output for the delta preset when colors are disabled.
     let name = if words.len() == 1 && words[0] == "delta" && !color {
@@ -115,11 +130,18 @@ fn run_tool(words: &[String], expected: &Path, actual: &Path, color: bool) -> io
         match name {
             "delta" => {
                 command.arg("--paging=never");
+                if inline {
+                    command.arg("--side-by-side");
+                }
                 command.arg("--diff-args=--no-ext-diff --no-textconv --color=always");
             }
             "git" => {
                 command.args([
-                    if color { "--paginate" } else { "--no-pager" },
+                    if color && !inline {
+                        "--paginate"
+                    } else {
+                        "--no-pager"
+                    },
                     "diff",
                     "--no-index",
                     "--no-ext-diff",

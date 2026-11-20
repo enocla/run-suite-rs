@@ -1201,3 +1201,112 @@ fn signaled_program_exit_still_cleans_up_descendants() {
     std::thread::sleep(Duration::from_millis(900));
     assert!(!suite.dir.path().join("survived").exists());
 }
+
+#[test]
+fn step_sends_exact_input_bytes_and_shows_both_checked_streams() {
+    use std::{io::Write, process::Stdio};
+
+    let suite = Suite::new("cat\nprintf 'actual error\\n' >&2");
+    suite.write("one.in", b"first\r\n\nlast\xff");
+    suite.write("one.out", b"first\r\n\nlast\xfe");
+    suite.write("one.err", "expected error\n");
+    suite.write("one.ret", "0\n");
+    let mut child = suite
+        .command()
+        .args([
+            "./program",
+            "-t",
+            "one",
+            "--step",
+            "-e",
+            "--diff-tool",
+            "builtin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"\n\n\n").unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    status(&output, 1);
+    let text = stdout(&output);
+    assert_eq!(text.matches("Press Enter").count(), 3);
+    assert!(text.contains("one.in line 3 | last\\xff"));
+    assert!(text.contains("last\\xfe [no final newline] | last\\xff [no final newline]"));
+    assert!(text.contains("expected error | actual error"));
+    assert!(text.contains("stdout differs at byte 12"));
+}
+
+#[test]
+fn step_fails_when_control_input_closes_before_enter() {
+    let suite = Suite::new("cat");
+    suite.write("one.in", "hello\n");
+    let output = suite
+        .command()
+        .args(["./program", "-t", "one", "--step"])
+        .output()
+        .unwrap();
+    status(&output, 1);
+    assert!(stdout(&output).contains("stdin closed while waiting for Enter"));
+}
+
+#[test]
+fn step_uses_delta_side_by_side_inline() {
+    let suite = Suite::new("printf 'actual\\n'");
+    suite.script(
+        "delta",
+        "printf '%s\\n' \"$@\" > diff.args; printf 'delta rendered\\n'; exit 1",
+    );
+    let output = diff_command(&suite)
+        .args(["--step", "--color", "always"])
+        .output()
+        .unwrap();
+
+    status(&output, 1);
+    assert!(stdout(&output).contains("delta rendered"));
+    let args = fs::read_to_string(suite.dir.path().join("diff.args")).unwrap();
+    assert!(args.starts_with("--paging=never\n--side-by-side\n"));
+}
+
+#[test]
+fn step_colors_prompts_and_matches_only_when_enabled() {
+    use std::process::Stdio;
+
+    let suite = Suite::new("cat\nprintf 'actual\\n'");
+    suite.write("one.in", "hello\n");
+    suite.write("one.out", "hello\nexpected\n");
+    let enter = suite.dir.path().join("enter");
+    fs::write(&enter, "\n").unwrap();
+
+    for mode in ["always", "never"] {
+        let output = suite
+            .command()
+            .args([
+                "./program",
+                "-t",
+                "one",
+                "--step",
+                "--diff-tool",
+                "builtin",
+                "--color",
+                mode,
+            ])
+            .stdin(Stdio::from(fs::File::open(&enter).unwrap()))
+            .output()
+            .unwrap();
+        status(&output, 1);
+        let text = stdout(&output);
+        if mode == "always" {
+            assert!(text.contains("\x1b[1;36mone.in line 1\x1b[0m"));
+            assert!(text.contains("\x1b[1;35mEnter\x1b[0m"));
+            assert!(text.contains("\x1b[32mhello\x1b[0m"));
+            assert!(text.contains("\x1b[33mexpected\x1b[0m"));
+            assert!(text.contains("\x1b[1;31mactual\x1b[0m"));
+        } else {
+            assert!(!text.contains('\x1b'));
+            assert!(text.contains("expected | actual"));
+        }
+    }
+}

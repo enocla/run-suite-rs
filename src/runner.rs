@@ -175,6 +175,20 @@ pub fn run_tests(
     cli: &Cli,
     mut report: impl FnMut(&TestResult),
 ) -> Vec<TestResult> {
+    if cli.step {
+        let mut results = Vec::new();
+        for stem in stems {
+            let result = run_test(stem, program, cli);
+            let stop = cli.fail_fast && !result.passed();
+            report(&result);
+            results.push(result);
+            if stop {
+                break;
+            }
+        }
+        return results;
+    }
+
     let next = AtomicUsize::new(0);
     let stopped = AtomicBool::new(false);
     let (sender, receiver) = mpsc::channel();
@@ -243,6 +257,14 @@ fn run_test(stem: &str, program: &Path, cli: &Cli) -> TestResult {
 
 fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Result<(), String> {
     let fixture = Fixture::load(stem, cli)?;
+    #[cfg(unix)]
+    let mut fixture = fixture;
+    #[cfg(unix)]
+    let step_input = if cli.step { fixture.input.take() } else { None };
+    #[cfg(unix)]
+    let stepping = step_input.is_some();
+    #[cfg(not(unix))]
+    let stepping = false;
     result.args.clone_from(&fixture.args);
     let temporary =
         tempfile::tempdir().map_err(|err| format!("cannot create temporary directory: {err}"))?;
@@ -282,7 +304,11 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
     };
     command
         .args(&fixture.args)
-        .stdin(fixture.input.map_or_else(Stdio::null, Stdio::from))
+        .stdin(if stepping {
+            Stdio::piped()
+        } else {
+            fixture.input.map_or_else(Stdio::null, Stdio::from)
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -298,10 +324,28 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
         }
     })?;
     let mut child = ReapChild(child);
-    let mut stdout = Capture::start(child.0.stdout.take().unwrap(), limit)
+    #[cfg(unix)]
+    let inline = stepping && crate::step::inline_enabled();
+    #[cfg(not(unix))]
+    let inline = false;
+    let mut stdout = Capture::start_with_preview(child.0.stdout.take().unwrap(), limit, inline)
         .map_err(|err| format!("cannot capture stdout: {err}"))?;
     let mut stderr = Capture::start(child.0.stderr.take().unwrap(), limit)
         .map_err(|err| format!("cannot capture stderr: {err}"))?;
+    #[cfg(unix)]
+    let mut steps = step_input
+        .map(|file| {
+            crate::step::Steps::new(
+                stem,
+                file,
+                child.0.stdin.take().unwrap(),
+                &fixture.stdout,
+                inline,
+                crate::report::output_color(cli.color),
+            )
+        })
+        .transpose()
+        .map_err(|err| format!("cannot step through input: {err}"))?;
     let start = Instant::now();
     let (status, timed_out) = loop {
         let mut exceeded = stdout.exceeded() || stderr.exceeded();
@@ -321,7 +365,14 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
                 return Err(format!("cannot wait for program: {err}"));
             }
         }
-        if start.elapsed() >= cli.timeout {
+        let elapsed = start.elapsed();
+        #[cfg(unix)]
+        let elapsed = elapsed.saturating_sub(
+            steps
+                .as_ref()
+                .map_or(Duration::ZERO, |steps| steps.paused()),
+        );
+        if elapsed >= cli.timeout {
             stop(&mut child.0);
             let status = child
                 .0
@@ -329,12 +380,22 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
                 .map_err(|err| format!("cannot reap timed-out program: {err}"))?;
             break (status, true);
         }
+        #[cfg(unix)]
+        if let Some(steps) = &mut steps
+            && steps
+                .advance(&stdout)
+                .map_err(|err| format!("cannot step through input: {err}"))?
+        {
+            continue;
+        }
         thread::sleep(Duration::from_millis(5));
     };
     // Always kill remaining descendants, including after a successful parent
     // exit, before draining the final buffered output.
     #[cfg(unix)]
     drop(watchdog);
+    #[cfg(unix)]
+    drop(steps);
     result.stdout = stdout
         .finish()
         .map_err(|err| format!("cannot read stdout: {err}"))?;
@@ -363,6 +424,12 @@ fn execute(stem: &str, program: &Path, cli: &Cli, result: &mut TestResult) -> Re
             result.problems.push(Problem::Message(format!(
                 "{stream} exceeded output limit of {limit} bytes (capture truncated)"
             )));
+        }
+    }
+    if cli.step {
+        crate::report::step_comparison(cli, stem, "stdout", &fixture.stdout, &result.stdout);
+        if let Some(expected) = &fixture.stderr {
+            crate::report::step_comparison(cli, stem, "stderr", expected, &result.stderr);
         }
     }
     if timed_out {

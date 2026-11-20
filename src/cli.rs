@@ -27,6 +27,10 @@ pub struct Cli {
     )]
     pub tests: Vec<String>,
 
+    /// Press Enter to send each .in line and inspect the output
+    #[arg(long, requires = "tests")]
+    pub step: bool,
+
     /// Also compare .err and .ret (both required)
     #[arg(short = 'e', long = "check-stderr")]
     pub check_stderr: bool,

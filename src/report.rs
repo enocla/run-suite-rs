@@ -4,6 +4,7 @@ use crate::{
     runner::{Problem, TestResult},
 };
 use std::{
+    borrow::Cow,
     env,
     io::{self, IsTerminal, Write},
     time::Duration,
@@ -14,33 +15,28 @@ pub struct Reporter {
     pub quiet: bool,
     pub nocapture: bool,
     diff_tool: DiffTool,
+    step: bool,
 }
 
 impl Reporter {
-    pub fn new(mode: ColorMode, quiet: bool, nocapture: bool, diff_tool: DiffTool) -> Self {
-        let color = match mode {
-            ColorMode::Always => true,
-            ColorMode::Never => false,
-            ColorMode::Auto => {
-                io::stdout().is_terminal()
-                    && env::var_os("NO_COLOR").is_none()
-                    && env::var("TERM").map_or(true, |term| term != "dumb")
-            }
-        };
+    pub fn new(
+        mode: ColorMode,
+        quiet: bool,
+        nocapture: bool,
+        diff_tool: DiffTool,
+        step: bool,
+    ) -> Self {
         Self {
-            color,
+            color: output_color(mode),
             quiet,
             nocapture,
             diff_tool,
+            step,
         }
     }
 
-    fn style(&self, text: &str, code: &str) -> String {
-        if self.color {
-            format!("\x1b[{code}m{text}\x1b[0m")
-        } else {
-            text.to_owned()
-        }
+    fn style<'a>(&self, text: &'a str, code: &str) -> Cow<'a, str> {
+        style(self.color, text, code)
     }
 
     pub fn start(&self, count: usize) {
@@ -63,6 +59,9 @@ impl Reporter {
         };
         if self.quiet {
             print!("{}", self.style(mark, code));
+            if self.step {
+                println!();
+            }
         } else {
             println!(
                 "test {} ... {} {}",
@@ -73,7 +72,7 @@ impl Reporter {
         }
         let _ = io::stdout().flush();
         if self.nocapture && result.passed() {
-            if self.quiet {
+            if self.quiet && !self.step {
                 println!();
             }
             self.captured(result);
@@ -158,7 +157,13 @@ impl Reporter {
                             expected.len(),
                             actual.len()
                         ), "1;33"));
-                    let shown = match self.diff_tool.show(stream, expected, actual, self.color) {
+                    if self.step {
+                        continue;
+                    }
+                    let shown = match self
+                        .diff_tool
+                        .show(stream, expected, actual, self.color, false)
+                    {
                         Ok(shown) => shown,
                         Err(err) => {
                             println!(
@@ -183,7 +188,7 @@ impl Reporter {
             }
         }
         // Always show complete stderr, even if an external diff hides context.
-        if !result.stdout.is_empty() && !has_mismatch(result, "stdout") {
+        if !self.step && !result.stdout.is_empty() && !has_mismatch(result, "stdout") {
             self.block("stdout", &result.stdout, " ", "36");
         }
         if !result.stderr.is_empty() {
@@ -215,7 +220,8 @@ impl Reporter {
         };
         for (index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
             let line = line.strip_suffix(b"\n").unwrap_or(line);
-            let text = self.style(&format!("{prefix} {}", visible_bytes(line)), color);
+            let text = format!("{prefix} {}", visible_bytes(line));
+            let text = self.style(&text, color);
             if numbered {
                 println!(
                     "    {} {text}",
@@ -263,6 +269,95 @@ impl Reporter {
             self.style(&format!("{filtered} filtered out"), "33"),
             self.style(&format!("{skipped} skipped"), "35"),
             self.style(&format!("finished in {}", format_duration(elapsed)), "2")
+        );
+    }
+}
+
+pub(crate) fn style<'a>(color: bool, text: &'a str, code: &str) -> Cow<'a, str> {
+    if color {
+        Cow::Owned(format!("\x1b[{code}m{text}\x1b[0m"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+pub(crate) fn output_color(mode: ColorMode) -> bool {
+    match mode {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => {
+            io::stdout().is_terminal()
+                && env::var_os("NO_COLOR").is_none()
+                && env::var("TERM").map_or(true, |term| term != "dumb")
+        }
+    }
+}
+
+pub(crate) fn step_comparison(
+    cli: &crate::cli::Cli,
+    stem: &str,
+    stream: &str,
+    expected: &[u8],
+    actual: &[u8],
+) {
+    let color = output_color(cli.color);
+    let title = format!("---- {} {stream} ----", safe_text(stem));
+    println!("\n{}", style(color, &title, "1;36"));
+    if expected != actual {
+        match cli.diff_tool.show(stream, expected, actual, color, true) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                let message = format!(
+                    "diff unavailable: {}; using built-in report",
+                    safe_text(&err)
+                );
+                println!("{}", style(color, &message, "33"));
+            }
+        }
+    }
+    side_by_side(expected, actual, color);
+}
+
+fn side_by_side(expected: &[u8], actual: &[u8], color: bool) {
+    fn text(line: &[u8]) -> String {
+        match line.strip_suffix(b"\n") {
+            Some(line) => visible_bytes(line),
+            None => format!("{} [no final newline]", visible_bytes(line)),
+        }
+    }
+
+    let expected = expected.split_inclusive(|&byte| byte == b'\n');
+    let mut actual = actual.split_inclusive(|&byte| byte == b'\n');
+    let width = expected
+        .clone()
+        .map(|line| text(line).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("Expected".len());
+    let left = format!("{:width$}", "Expected");
+    let separator = style(color, " | ", "2");
+    println!(
+        "{}{separator}{}",
+        style(color, &left, "1;36"),
+        style(color, "Actual", "1;32")
+    );
+
+    let mut expected = expected;
+    loop {
+        let left = expected.next();
+        let right = actual.next();
+        if left.is_none() && right.is_none() {
+            break;
+        }
+        let expected = left.map(text).unwrap_or_default();
+        let actual = right.map(text).unwrap_or_default();
+        let left_code = if left == right { "36" } else { "33" };
+        let right_code = if left == right { "32" } else { "1;31" };
+        println!(
+            "{}{separator}{}",
+            style(color, &format!("{expected:width$}"), left_code),
+            style(color, &actual, right_code),
         );
     }
 }

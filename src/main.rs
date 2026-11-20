@@ -4,6 +4,8 @@ mod diff;
 mod report;
 mod runner;
 #[cfg(unix)]
+mod step;
+#[cfg(unix)]
 mod watchdog;
 
 use clap::Parser;
@@ -51,8 +53,18 @@ fn run(cli: &Cli) -> Result<bool, String> {
         println!("\n{} tests; {filtered} filtered out", selected.len());
         return Ok(true);
     }
+    #[cfg(not(unix))]
+    if cli.step {
+        return Err("--step is supported on Unix only".into());
+    }
     let program = runner::resolve_program(&cli.program)?;
-    let reporter = Reporter::new(cli.color, cli.quiet, cli.nocapture, cli.diff_tool.clone());
+    let reporter = Reporter::new(
+        cli.color,
+        cli.quiet,
+        cli.nocapture,
+        cli.diff_tool.clone(),
+        cli.step,
+    );
     reporter.start(selected.len());
     let start = Instant::now();
     let results = runner::run_tests(&selected, &program, cli, |result| reporter.result(result));

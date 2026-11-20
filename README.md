@@ -32,6 +32,24 @@ extensions such as `.out`; the usual fixture files are loaded from the current
 working directory. Direct tests are reported in the order supplied, including repeats.
 `--test` cannot be combined with a suite file. All other options apply as usual.
 
+On Unix, use `--step` to debug a direct test interactively:
+
+```sh
+runSuite ./a2q3-exec -t test1 --step
+```
+
+The runner previews each line of `test1.in` and sends it when you press Enter.
+It closes the program's stdin after the last line. Time spent waiting for Enter
+doesn't count toward `--timeout`. On a terminal, the preview below the prompt
+updates as stdout arrives and pairs the latest observed line with its expected
+line. Programs that buffer stdout may only show output when they flush or exit.
+
+After the program finishes, the runner compares stdout and, with `-e`, stderr.
+The default uses Delta in side-by-side mode when color is enabled and Delta is
+installed. Otherwise it uses the built-in two-column view. An explicit
+`--diff-tool` selects the renderer for differences. Step mode runs tests
+sequentially and compares the original output bytes for pass or fail.
+
 Example output excerpt with `--diff-tool builtin` (headings, test names, diagnostics,
 commands, and summary counts are colored on a terminal):
 
@@ -95,6 +113,7 @@ An executable can be an explicit path, a bare local name, or a command on `PATH`
 | Option | Behavior |
 | --- | --- |
 | `-t STEM`, `--test STEM` | Run a test stem directly without a suite; repeat for a set. |
+| `--step` | With `-t`, send one input line per Enter and compare output side by side (Unix). |
 | `-e`, `--check-stderr` | Compare stderr and exit status using `.err` and `.ret`. |
 | `-v`, `--valgrind` | Run under Memcheck; show its log and fail on reported memory errors. |
 | `--filter PATTERN` | Select test stems containing any supplied pattern; repeat for a set. |
